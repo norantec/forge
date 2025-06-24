@@ -16,6 +16,9 @@ import * as readline from 'node:readline';
 import * as chalk from 'chalk';
 import { Schema } from '@open-norantec/utilities/dist/schema-util.class';
 import { Command } from 'commander';
+import * as originalFs from 'fs';
+import * as originalFsPromises from 'fs/promises';
+import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
@@ -250,14 +253,127 @@ class RunOncePlugin {
     }
 }
 
-const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'none']).default('none');
+class CompilePlugin {
+    public constructor(
+        private readonly absoluteOutputPath: string,
+        private readonly volume: memfs.IFs,
+        private readonly onLog?: LogHandler,
+    ) {}
+
+    public apply(compiler: webpack.Compiler) {
+        compiler.hooks.compilation.tap(CompilePlugin.name, (compilation) => {
+            compilation.hooks.processAssets.tap(
+                {
+                    name: CompilePlugin.name,
+                    stage: webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE,
+                },
+                (assets) => {
+                    const relativePath = Object.keys(assets).find((currentRelativePath) => {
+                        return currentRelativePath?.endsWith?.('.js');
+                    });
+
+                    if (StringUtil.isFalsyString(relativePath)) return;
+
+                    try {
+                        const nodeVersion = process.version.split('.')[0].replace(/^v/g, '');
+                        const absoluteBundlePath = path.resolve(this.absoluteOutputPath, relativePath!);
+
+                        const matchBundlePath = (pathname: originalFs.PathLike) => {
+                            return typeof pathname === 'string' && path.resolve(pathname) === absoluteBundlePath;
+                        };
+                        const createPatchedFsMethod = <T extends (...args: any[]) => any>(
+                            proxiedFn: (...args: any[]) => any,
+                            originalFn: (...args: Parameters<T>) => ReturnType<T>,
+                            isPromise = false,
+                        ): T => {
+                            return ((pathname: string, ...args) => {
+                                if (matchBundlePath(pathname)) {
+                                    if (isPromise) {
+                                        return new Promise((resolve, reject) => {
+                                            try {
+                                                resolve(proxiedFn?.(pathname, ...args));
+                                            } catch (error) {
+                                                reject(error);
+                                            }
+                                        });
+                                    } else {
+                                        return proxiedFn?.(pathname, ...args);
+                                    }
+                                }
+                                return originalFn?.(...([pathname, ...args] as Parameters<T>));
+                            }) as T;
+                        };
+                        const proxiedFsPromises: typeof originalFsPromises = {
+                            ...originalFsPromises,
+                            ...['stat', 'lstat', 'readFile', 'readdir', 'rm'].reduce(
+                                (result, methodName) => {
+                                    result[methodName] = createPatchedFsMethod(
+                                        this.volume[`${methodName}Sync`].bind(this.volume),
+                                        originalFsPromises[methodName].bind(originalFsPromises),
+                                        true,
+                                    );
+                                    return result;
+                                },
+                                {} as Partial<typeof originalFsPromises>,
+                            ),
+                        };
+                        const proxiedFs: typeof originalFs = {
+                            ...originalFs,
+                            ...['existsSync', 'realpathSync'].reduce((result, methodName) => {
+                                result[methodName] = createPatchedFsMethod(
+                                    this.volume[methodName].bind(this.volume),
+                                    originalFs[methodName].bind(originalFs),
+                                );
+                                return result;
+                            }, {}),
+                            promises: {
+                                ...originalFs.promises,
+                                ...proxiedFsPromises,
+                            },
+                        };
+
+                        this.volume.mkdirSync(path.dirname(absoluteBundlePath), { recursive: true });
+                        this.volume.writeFileSync(absoluteBundlePath, assets[relativePath!]?.buffer?.());
+                        VMUtil.runScriptCode(
+                            `
+                                const Module = require('module');
+                                const originalLoad = Module._load;
+                                Module._load = function(request, parent) {
+                                    if (request === 'fs' || request === 'node:fs') return proxiedFs;
+                                    if (request === 'fs/promises' || request === 'node:fs/promises') return proxiedFsPromises;
+                                    return originalLoad.apply(this, arguments);
+                                };
+                                const { exec } = require('@yao-pkg/pkg');
+                                exec(['${absoluteBundlePath}', '--target', '${['linux', 'macos', 'win'].map((os) => `node${nodeVersion}-${os}-${process.arch}`)}', '--out-path', '${this.absoluteOutputPath}']);
+                                proxiedFs.unlinkSync('${absoluteBundlePath}');
+                            `,
+                            {
+                                volume: this.volume,
+                                proxiedFs,
+                                proxiedFsPromises,
+                            },
+                        );
+
+                        _.unset(assets, relativePath!);
+                    } catch (error) {
+                        this.onLog?.(
+                            'error',
+                            `Error compiling to binary: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
+                        );
+                        process.exit(1);
+                    }
+                },
+            );
+        });
+    }
+}
+
+const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none']).default('none');
 
 const FORGE_OPTIONS_SCHEMA = z.object({
-    binary: z.boolean().optional(),
     clean: z.boolean().optional().default(true),
     debug: z.union([z.boolean().default(false), z.undefined()]),
     entry: z.union([z.string().default('main.ts'), z.undefined()]),
-    mode: z.union([z.enum(['development', 'production']).default('production'), z.undefined()]),
     outputDir: z.union([z.string().default('dist'), z.undefined()]),
     outputName: z.union([z.string().default('main'), z.undefined()]),
     outputNameFormat: z.union([z.string().default('[name].js'), z.undefined()]),
@@ -269,7 +385,8 @@ const FORGE_OPTIONS_SCHEMA = z.object({
 type ForgeBaseOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
 type AfterEmitAction = z.infer<typeof AFTER_EMIT_ACTION_SCHEMA>;
 
-export interface ForgeGetEntryFileContentContext {
+export interface ForgeContext {
+    afterEmitAction: AfterEmitAction;
     entryDirPath: string;
     entryFilePath: string;
     options: ForgeBaseOptions;
@@ -279,8 +396,9 @@ export interface ForgeGetEntryFileContentContext {
 }
 
 export type ForgeOptions = ForgeBaseOptions & {
-    getEntryFileContent?: (context: ForgeGetEntryFileContentContext) => string;
+    getEntryFileContent?: (context: ForgeContext) => string;
     onLog?: LogHandler;
+    getMode?: (context: ForgeContext) => 'development' | 'production';
     onProgress?: (percentage: number, message: string, ...params: string[]) => void;
 };
 
@@ -320,8 +438,17 @@ export class Forge {
         );
     }
 
-    public run(inputAfterEmitActionType: AfterEmitAction) {
-        const afterEmitActionType = AFTER_EMIT_ACTION_SCHEMA.parse(inputAfterEmitActionType);
+    public run(inputAfterEmitAction: AfterEmitAction) {
+        const afterEmitAction = AFTER_EMIT_ACTION_SCHEMA.parse(inputAfterEmitAction);
+        const context: ForgeContext = {
+            afterEmitAction,
+            entryDirPath: this.entryDirPath,
+            entryFilePath: this.entryFilePath,
+            options: this.options,
+            outputPath: this.outputPath,
+            tsConfig: this.tsConfig,
+            virtualEntryFilePath: this.virtualEntryFilePath,
+        };
 
         if (StringUtil.isFalsyString(this.options.outputName!)) throw new Error(`Invalid generate type`);
 
@@ -343,7 +470,7 @@ export class Forge {
                 [name!]: this.virtualEntryFilePath,
             },
             target: 'node',
-            mode: this.options.mode,
+            mode: this.inputOptions?.getMode?.(context) ?? 'production',
             output: {
                 devtoolModuleFilenameTemplate: '[absolute-resource-path]',
                 filename: this.options.outputNameFormat,
@@ -391,14 +518,7 @@ export class Forge {
                         new VirtualModulesPlugin({
                             [this.virtualEntryFilePath]: (() => {
                                 if (typeof this.inputOptions?.getEntryFileContent === 'function') {
-                                    return this.inputOptions.getEntryFileContent({
-                                        entryDirPath: this.entryDirPath,
-                                        entryFilePath: this.entryFilePath,
-                                        options: this.options,
-                                        outputPath: this.outputPath,
-                                        tsConfig: this.tsConfig,
-                                        virtualEntryFilePath: this.virtualEntryFilePath,
-                                    });
+                                    return this.inputOptions.getEntryFileContent(context);
                                 }
                                 return fs.readFileSync(this.entryFilePath).toString();
                             })(),
@@ -406,19 +526,20 @@ export class Forge {
                     );
 
                     if (
-                        !(['run-once', 'watch'] as AfterEmitAction[]).includes(afterEmitActionType) ||
+                        !(['run-once', 'watch'] as AfterEmitAction[]).includes(afterEmitAction) ||
                         this.options?.debug
                     ) {
                         result.push(new ForceWriteBundlePlugin(this.outputPath));
                         if (this.options?.debug) return result;
                     }
 
-                    if (afterEmitActionType === 'run-once') {
+                    if (afterEmitAction === 'run-once') {
                         result.push(new RunOncePlugin(this.options?.onLog));
                     }
 
-                    if (afterEmitActionType === 'watch') {
-                        const volume = new memfs.Volume() as memfs.IFs;
+                    const volume = new memfs.Volume() as memfs.IFs;
+
+                    if (afterEmitAction === 'watch') {
                         result.push(
                             new VirtualFilePlugin(volume),
                             new AutoRunPlugin(
@@ -437,6 +558,10 @@ export class Forge {
                                 volume,
                             ),
                         );
+                    }
+
+                    if (afterEmitAction === 'compile') {
+                        result.push(new CompilePlugin(this.outputPath, volume, this.options?.onLog));
                     }
 
                     return result;
@@ -464,7 +589,7 @@ export class Forge {
             });
         };
 
-        if (afterEmitActionType === 'watch') {
+        if (afterEmitAction === 'watch') {
             const ig = ignore().add(
                 (() => {
                     const gitIgnorePath = path.resolve('.gitignore');
@@ -503,8 +628,7 @@ export const createForgeCommand = (options?: Partial<ForgeOptions>) => {
     const command = new Command();
     command
         .argument('<entry>', 'Entry path relative to work-dir and source-dir, e.g. main.ts')
-        .option('--after-emit-action <string>', 'Action after emitting, e.g. watch/run-once')
-        .option('--binary', 'Compile output JavaScript bundle to an executable')
+        .option('--after-emit-action <string>', 'Action after emitting, e.g. watch/run-once/compile', 'none')
         .option('--clean', 'Clean legacy output', true)
         .option('--work-dir <string>', 'Work directory path', process.cwd())
         .option('--source-dir <string>', 'Source directory path', 'src')
