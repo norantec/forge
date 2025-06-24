@@ -28,6 +28,7 @@
     },
     "homepage": "https://github.com/norantec/forge#readme",
     "dependencies": {
+        "@open-norantec/herbal": "^1.0.0-alpha.13",
         "@open-norantec/utilities": "^1.0.0-alpha.19",
         "@yao-pkg/pkg": "^6.5.1",
         "chokidar": "^3.6.0",
