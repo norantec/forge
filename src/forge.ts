@@ -21,6 +21,9 @@ import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
 import { EventEmitter } from 'eventemitter3';
 
+const EMITTED = Symbol();
+const RUN = Symbol();
+
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
 function renderProgressBar(percent, message, file) {
@@ -280,9 +283,6 @@ export type ForgeOptions = ForgeBaseOptions & {
     onProgress?: (percentage: number, message: string, ...params: string[]) => void;
 };
 
-const EMITTED = Symbol();
-const RUN = Symbol();
-
 export class Forge {
     protected options: ForgeOptions;
     protected tsConfig: ts.ParsedCommandLine;
@@ -291,8 +291,8 @@ export class Forge {
     protected outputPath: string;
     protected virtualEntryFilePath: string;
     protected readonly emitter = new EventEmitter();
-    protected compiler: webpack.Compiler;
-    protected worker: Worker;
+    protected compiler: webpack.Compiler | null = null;
+    protected worker: Worker | null = null;
 
     public constructor(private readonly inputOptions: ForgeOptions) {
         this.options = FORGE_OPTIONS_SCHEMA.parse(this.inputOptions);
@@ -324,8 +324,15 @@ export class Forge {
         if (this.options.afterEmitAction! === 'watch') {
             const watchHandler = () => {
                 _.attempt(() => this.worker!.terminate());
-                _.attempt(() => this.compiler!.close(() => {}));
-                this.emitter.emit(RUN);
+                this.worker = null;
+                _.attempt(() =>
+                    this.compiler!.close((error) => {
+                        if (!error && !this.compiler?.running) {
+                            this.compiler = null;
+                            this.emitter.emit(RUN);
+                        }
+                    }),
+                );
             };
             const ig = ignore().add(
                 (() => {
@@ -479,16 +486,18 @@ export class Forge {
         });
 
         const runCompiler = () => {
-            this.compiler.run((error, result) => {
-                if (error) {
-                    this.inputOptions?.onLog?.(
-                        'error',
-                        `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
-                    );
-                } else {
-                    this.emitter.emit(EMITTED, result);
-                }
-            });
+            if (this.compiler instanceof webpack.Compiler) {
+                this.compiler.run((error, result) => {
+                    if (error) {
+                        this.inputOptions?.onLog?.(
+                            'error',
+                            `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
+                        );
+                    } else {
+                        this.emitter.emit(EMITTED, result);
+                    }
+                });
+            }
         };
 
         if (this.options?.clean && (['compile', 'none'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
