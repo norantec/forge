@@ -499,7 +499,7 @@ export class Forge {
     }
 }
 
-export const createForgeCommand = (options?: Pick<ForgeOptions, 'getEntryFileContent' | 'onLog'>) => {
+export const createForgeCommand = (options?: Partial<ForgeOptions>) => {
     const command = new Command();
     command
         .argument('<entry>', 'Entry path relative to work-dir and source-dir, e.g. main.ts')
@@ -516,8 +516,8 @@ export const createForgeCommand = (options?: Pick<ForgeOptions, 'getEntryFileCon
         .action((entry, commandOptions) => {
             new Forge({
                 entry,
+                ...options,
                 ..._.omit(commandOptions, ['afterEmitAction']),
-                ..._.pick(options, ['onLog', 'getEntryFileContent']),
             } as unknown as ForgeOptions).run(commandOptions?.afterEmitAction);
         });
     return command;
