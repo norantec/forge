@@ -20,7 +20,6 @@ import * as originalFs from 'fs';
 import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
 import { EventEmitter } from 'eventemitter3';
-import { esbuildDecorators } from 'esbuild-plugin-typescript-decorators';
 
 const EMITTED = Symbol();
 const RUN = Symbol();
@@ -446,7 +445,6 @@ export class Forge {
                                 options: {
                                     target: 'es2017',
                                     tsconfig: path.resolve(this.options.workDir!, this.options.tsProject!),
-                                    plugins: [esbuildDecorators()],
                                 },
                             };
                         })(),
