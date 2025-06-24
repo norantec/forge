@@ -19,6 +19,7 @@ import { Command } from 'commander';
 import * as originalFs from 'fs';
 import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
+import { EventEmitter } from 'eventemitter3';
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
@@ -106,14 +107,6 @@ class CleanNonJSFilePlugin {
     }
 }
 
-class VirtualFilePlugin {
-    public constructor(private readonly volume: memfs.IFs) {}
-
-    public apply(compiler: webpack.Compiler) {
-        compiler.outputFileSystem = this.volume as webpack.OutputFileSystem;
-    }
-}
-
 class ForceWriteBundlePlugin {
     public constructor(private readonly outputPath: string) {}
 
@@ -131,121 +124,6 @@ class ForceWriteBundlePlugin {
                             fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
                         });
                         fs.writeFileSync(absolutePath, asset?.buffer?.());
-                    });
-                },
-            );
-        });
-    }
-}
-
-interface AutoRunPluginOptions {
-    parallel?: boolean;
-    onAfterStart?: (worker: Worker) => void | Promise<void>;
-    onBeforeStart?: () => void | Promise<void>;
-    onLog?: LogHandler;
-}
-
-class AutoRunPlugin {
-    public constructor(
-        private readonly options: AutoRunPluginOptions = {},
-        private readonly volume: memfs.IFs,
-    ) {}
-
-    public apply(compiler: webpack.Compiler) {
-        compiler.hooks.beforeCompile.tapAsync('AutoRunPlugin', async (compilationParams, callback) => {
-            if (this.options.onBeforeStart) {
-                await this.options?.onBeforeStart?.();
-            }
-            callback();
-        });
-        compiler.hooks.afterEmit.tapAsync('AutoRunPlugin', async (compilation: webpack.Compilation, callback) => {
-            const assets = compilation.getAssets();
-
-            if (assets.length === 0) {
-                this.options?.onLog?.('warn', 'No output file was found, skipping...');
-                callback();
-                return;
-            }
-
-            const bundledScriptFile = assets?.find?.((item) => item?.name?.endsWith?.('.js'))?.name;
-
-            if (StringUtil.isFalsyString(bundledScriptFile)) {
-                this.options?.onLog?.('warn', 'No output file was found, skipping...');
-                callback();
-                return;
-            }
-
-            const outputPath = path.resolve(compilation.options.output.path!, bundledScriptFile!);
-
-            this.options?.onLog?.('info', `Prepared to run file: ${outputPath}`);
-
-            const worker = new Worker(this.volume.readFileSync(outputPath).toString(), {
-                eval: true,
-            });
-
-            if (this.options.onAfterStart) {
-                await this.options?.onAfterStart?.(worker);
-            }
-
-            worker.on('exit', (code) => {
-                if (code !== 0) {
-                    this.options?.onLog?.('error', `Process exited with code: ${code}`);
-                }
-                if (!this.options?.parallel) {
-                    callback();
-                }
-            });
-            worker.on('error', (error) => {
-                this.options?.onLog?.('error', 'Worker error:');
-                this.options?.onLog?.('error', error?.message);
-                this.options?.onLog?.('error', error?.stack?.toString?.());
-                if (!this.options?.parallel) {
-                    callback();
-                }
-            });
-
-            if (this.options?.parallel) {
-                callback();
-            }
-        });
-    }
-}
-
-class RunOncePlugin {
-    public constructor(private readonly onLog?: LogHandler) {}
-
-    public apply(compiler: webpack.Compiler) {
-        compiler.hooks.compilation.tap(RunOncePlugin.name, (compilation) => {
-            compilation.hooks.processAssets.tapAsync(
-                {
-                    name: RunOncePlugin.name,
-                    stage: webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE,
-                },
-                (assets, callback) => {
-                    const targetAsset = Object.entries(assets)?.find?.(([pathname]) => pathname?.endsWith?.('.js'));
-
-                    if (!targetAsset) {
-                        throw new Error('Not found any JS bundle file, exitting...');
-                    }
-
-                    this.onLog?.('info', `Found bundle file: ${targetAsset?.[0]}, executing...`);
-
-                    const worker = new Worker(targetAsset?.[1]?.buffer?.()?.toString?.(), {
-                        eval: true,
-                    });
-
-                    worker.on('exit', (code) => {
-                        if (code !== 0) {
-                            this?.onLog?.('error', `Process exited with code: ${code}`);
-                        }
-                        callback();
-                    });
-
-                    worker.on('error', (error) => {
-                        this?.onLog?.('error', 'Worker error:');
-                        this?.onLog?.('error', error?.message);
-                        this?.onLog?.('error', error?.stack?.toString?.());
-                        callback(error);
                     });
                 },
             );
@@ -371,6 +249,7 @@ class CompilePlugin {
 const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none']).default('none');
 
 const FORGE_OPTIONS_SCHEMA = z.object({
+    afterEmitAction: z.union([AFTER_EMIT_ACTION_SCHEMA, z.undefined()]),
     clean: z.boolean().optional().default(true),
     debug: z.union([z.boolean().default(false), z.undefined()]),
     entry: z.union([z.string().default('main.ts'), z.undefined()]),
@@ -386,7 +265,6 @@ type ForgeBaseOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
 type AfterEmitAction = z.infer<typeof AFTER_EMIT_ACTION_SCHEMA>;
 
 export interface ForgeContext {
-    afterEmitAction: AfterEmitAction;
     entryDirPath: string;
     entryFilePath: string;
     options: ForgeBaseOptions;
@@ -402,6 +280,9 @@ export type ForgeOptions = ForgeBaseOptions & {
     onProgress?: (percentage: number, message: string, ...params: string[]) => void;
 };
 
+const EMITTED = Symbol();
+const RUN = Symbol();
+
 export class Forge {
     protected options: ForgeOptions;
     protected tsConfig: ts.ParsedCommandLine;
@@ -409,6 +290,9 @@ export class Forge {
     protected entryDirPath: string;
     protected outputPath: string;
     protected virtualEntryFilePath: string;
+    protected readonly emitter = new EventEmitter();
+    protected compiler: webpack.Compiler;
+    protected worker: Worker;
 
     public constructor(private readonly inputOptions: ForgeOptions) {
         this.options = FORGE_OPTIONS_SCHEMA.parse(this.inputOptions);
@@ -436,12 +320,59 @@ export class Forge {
             this.entryDirPath,
             `virtual_${Math.random().toString(32).slice(2)}.ts`,
         );
+
+        if (this.options.afterEmitAction! === 'watch') {
+            const watchHandler = () => {
+                _.attempt(() => this.worker!.terminate());
+                _.attempt(() => this.compiler!.close(() => {}));
+                this.emitter.emit(RUN);
+            };
+            const ig = ignore().add(
+                (() => {
+                    const gitIgnorePath = path.resolve('.gitignore');
+                    if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
+                        return fs.readFileSync(gitIgnorePath).toString();
+                    }
+                    return '';
+                })(),
+            );
+            const watcher = chokidar.watch(process.cwd(), {
+                persistent: true,
+                ignoreInitial: true,
+                ignored: (pathname) => {
+                    const relativePath = path.relative(process.cwd(), pathname);
+                    if (StringUtil.isFalsyString(relativePath)) return false;
+                    if (relativePath.startsWith('.git')) return true;
+                    return ig.ignores(relativePath);
+                },
+            });
+            watcher.on('change', watchHandler);
+            watcher.on('add', watchHandler);
+            watcher.on('unlink', watchHandler);
+        }
+
+        this.emitter.addListener(EMITTED, (result: webpack.Stats | undefined) => {
+            if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
+                const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(([fileName]) =>
+                    fileName?.endsWith?.('.js'),
+                )?.[1];
+
+                if (!bundleFileSource) {
+                    throw new Error('Cannot find any file to run');
+                }
+
+                this.worker = new Worker(bundleFileSource.buffer().toString(), {
+                    eval: true,
+                });
+            }
+        });
+        this.emitter.addListener(RUN, () => {
+            this.run();
+        });
     }
 
-    public run(inputAfterEmitAction: AfterEmitAction) {
-        const afterEmitAction = AFTER_EMIT_ACTION_SCHEMA.parse(inputAfterEmitAction);
+    public run() {
         const context: ForgeContext = {
-            afterEmitAction,
             entryDirPath: this.entryDirPath,
             entryFilePath: this.entryFilePath,
             options: this.options,
@@ -452,8 +383,8 @@ export class Forge {
 
         if (StringUtil.isFalsyString(this.options.outputName!)) throw new Error(`Invalid generate type`);
 
-        let currentWorker: Worker | null = null;
-        const compiler = webpack({
+        const volume = new memfs.Volume() as memfs.IFs;
+        this.compiler = webpack({
             cache: false,
             optimization: {
                 minimize: false,
@@ -526,41 +457,14 @@ export class Forge {
                     );
 
                     if (
-                        !(['run-once', 'watch'] as AfterEmitAction[]).includes(afterEmitAction) ||
+                        !(['run-once', 'watch'] as AfterEmitAction[]).includes(this.options.afterEmitAction!) ||
                         this.options?.debug
                     ) {
                         result.push(new ForceWriteBundlePlugin(this.outputPath));
                         if (this.options?.debug) return result;
                     }
 
-                    if (afterEmitAction === 'run-once') {
-                        result.push(new RunOncePlugin(this.options?.onLog));
-                    }
-
-                    const volume = new memfs.Volume() as memfs.IFs;
-
-                    if (afterEmitAction === 'watch') {
-                        result.push(
-                            new VirtualFilePlugin(volume),
-                            new AutoRunPlugin(
-                                {
-                                    parallel: true,
-                                    onAfterStart: (worker) => {
-                                        currentWorker = worker;
-                                    },
-                                    onBeforeStart: () => {
-                                        _.attempt(() => {
-                                            currentWorker!.terminate();
-                                        });
-                                    },
-                                    onLog: this.options?.onLog,
-                                },
-                                volume,
-                            ),
-                        );
-                    }
-
-                    if (afterEmitAction === 'compile') {
+                    if (this.options.afterEmitAction! === 'compile') {
                         result.push(new CompilePlugin(this.outputPath, volume, this.options?.onLog));
                     }
 
@@ -570,51 +474,61 @@ export class Forge {
         });
 
         const runCompiler = () => {
-            compiler.run((error) => {
+            this.compiler.run((error, result) => {
                 if (error) {
                     this.inputOptions?.onLog?.(
                         'error',
                         `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
                     );
+                } else {
+                    // if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
+                    //     const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(([fileName]) =>
+                    //         fileName?.endsWith?.('.js'),
+                    //     )?.[1];
+
+                    //     if (!bundleFileSource) {
+                    //         throw new Error('Cannot find any file to run');
+                    //     }
+
+                    //     const worker = new Worker(bundleFileSource.buffer().toString(), {
+                    //         eval: true,
+                    //     });
+
+                    //     if (this.options.afterEmitAction! === 'watch') {
+                    //         const watchHandler = () => {
+                    //             _.attempt(() => worker!.terminate());
+                    //             runCompiler();
+                    //         };
+                    //         const ig = ignore().add(
+                    //             (() => {
+                    //                 const gitIgnorePath = path.resolve('.gitignore');
+                    //                 if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
+                    //                     return fs.readFileSync(gitIgnorePath).toString();
+                    //                 }
+                    //                 return '';
+                    //             })(),
+                    //         );
+                    //         const watcher = chokidar.watch(process.cwd(), {
+                    //             persistent: true,
+                    //             ignoreInitial: true,
+                    //             ignored: (pathname) => {
+                    //                 const relativePath = path.relative(process.cwd(), pathname);
+                    //                 if (StringUtil.isFalsyString(relativePath)) return false;
+                    //                 if (relativePath.startsWith('.git')) return true;
+                    //                 return ig.ignores(relativePath);
+                    //             },
+                    //         });
+                    //         watcher.on('change', watchHandler);
+                    //         watcher.on('add', watchHandler);
+                    //         watcher.on('unlink', watchHandler);
+                    //     }
+                    // }
+                    this.emitter.emit(EMITTED, result);
                 }
             });
         };
-        const watchHandler = () => {
-            _.attempt(() => currentWorker!.terminate());
-            currentWorker = null;
-            _.attempt(() => {
-                compiler.close(() => {
-                    runCompiler();
-                });
-            });
-        };
 
-        if (afterEmitAction === 'watch') {
-            const ig = ignore().add(
-                (() => {
-                    const gitIgnorePath = path.resolve('.gitignore');
-                    if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
-                        return fs.readFileSync(gitIgnorePath).toString();
-                    }
-                    return '';
-                })(),
-            );
-            const watcher = chokidar.watch(process.cwd(), {
-                persistent: true,
-                ignoreInitial: true,
-                ignored: (pathname) => {
-                    const relativePath = path.relative(process.cwd(), pathname);
-                    if (StringUtil.isFalsyString(relativePath)) return false;
-                    if (relativePath.startsWith('.git')) return true;
-                    return ig.ignores(relativePath);
-                },
-            });
-            watcher.on('change', watchHandler);
-            watcher.on('add', watchHandler);
-            watcher.on('unlink', watchHandler);
-        }
-
-        if (this.options?.clean && (['compile', 'none'] as AfterEmitAction[]).includes(afterEmitAction)) {
+        if (this.options?.clean && (['compile', 'none'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
             this.inputOptions?.onLog?.('info', `Cleaning output directory: ${this.outputPath}`);
             _.attempt(() => fs.rmSync(this.outputPath, { recursive: true, force: true }));
             this.inputOptions?.onLog?.('info', 'Output directory cleaned');
@@ -624,7 +538,11 @@ export class Forge {
     }
 }
 
-export const createForgeCommand = (options?: Partial<ForgeOptions>) => {
+export interface CreateForgeCommandOptions extends Partial<ForgeOptions> {
+    hideOptions?: string[];
+}
+
+export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
     const command = new Command();
     command
         .argument('<entry>', 'Entry path relative to work-dir and source-dir, e.g. main.ts')
@@ -641,8 +559,8 @@ export const createForgeCommand = (options?: Partial<ForgeOptions>) => {
             new Forge({
                 entry,
                 ...options,
-                ..._.omit(commandOptions, ['afterEmitAction']),
-            } as unknown as ForgeOptions).run(commandOptions?.afterEmitAction);
+                ...commandOptions,
+            } as unknown as ForgeOptions).run();
         });
     return command;
 };
