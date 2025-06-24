@@ -486,48 +486,6 @@ export class Forge {
                         `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
                     );
                 } else {
-                    // if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-                    //     const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(([fileName]) =>
-                    //         fileName?.endsWith?.('.js'),
-                    //     )?.[1];
-
-                    //     if (!bundleFileSource) {
-                    //         throw new Error('Cannot find any file to run');
-                    //     }
-
-                    //     const worker = new Worker(bundleFileSource.buffer().toString(), {
-                    //         eval: true,
-                    //     });
-
-                    //     if (this.options.afterEmitAction! === 'watch') {
-                    //         const watchHandler = () => {
-                    //             _.attempt(() => worker!.terminate());
-                    //             runCompiler();
-                    //         };
-                    //         const ig = ignore().add(
-                    //             (() => {
-                    //                 const gitIgnorePath = path.resolve('.gitignore');
-                    //                 if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
-                    //                     return fs.readFileSync(gitIgnorePath).toString();
-                    //                 }
-                    //                 return '';
-                    //             })(),
-                    //         );
-                    //         const watcher = chokidar.watch(process.cwd(), {
-                    //             persistent: true,
-                    //             ignoreInitial: true,
-                    //             ignored: (pathname) => {
-                    //                 const relativePath = path.relative(process.cwd(), pathname);
-                    //                 if (StringUtil.isFalsyString(relativePath)) return false;
-                    //                 if (relativePath.startsWith('.git')) return true;
-                    //                 return ig.ignores(relativePath);
-                    //             },
-                    //         });
-                    //         watcher.on('change', watchHandler);
-                    //         watcher.on('add', watchHandler);
-                    //         watcher.on('unlink', watchHandler);
-                    //     }
-                    // }
                     this.emitter.emit(EMITTED, result);
                 }
             });
@@ -547,25 +505,77 @@ export interface CreateForgeCommandOptions extends Partial<ForgeOptions> {
     hideOptions?: string[];
 }
 
+interface Option {
+    flags: string;
+    defaultValue?: string | boolean | string[];
+    description?: string;
+}
+
 export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
     const command = new Command();
-    command
-        .argument('<entry>', 'Entry path relative to work-dir and source-dir, e.g. main.ts')
-        .option('--after-emit-action <string>', 'Action after emitting, e.g. watch/run-once/compile', 'none')
-        .option('--clean', 'Clean legacy output', true)
-        .option('--work-dir <string>', 'Work directory path', process.cwd())
-        .option('--source-dir <string>', 'Source directory path', 'src')
-        .option('--output-dir <string>', 'Output directory path', 'dist')
-        .option('--output-name <string>', 'Output file name', 'main')
-        .option('--output-name-format <string>', 'Ouptput file name format', '[name].js')
-        .option('--ts-project <string>', 'Path for TypeScript config file', 'tsconfig.json')
-        .option('--debug', 'Debug mode', false)
-        .action((entry, commandOptions) => {
-            new Forge({
-                entry,
-                ...options,
-                ...commandOptions,
-            } as unknown as ForgeOptions).run();
-        });
+
+    command.argument('<entry>', 'Entry path relative to work-dir and source-dir, e.g. main.ts');
+
+    (
+        [
+            {
+                flags: '--after-emit-action <string>',
+                description: 'Action after emitting, e.g. watch/run-once/compile',
+                defaultValue: 'none',
+            },
+            {
+                flags: '--clean',
+                description: 'Clean legacy output',
+                defaultValue: true,
+            },
+            {
+                flags: '--work-dir <string>',
+                description: 'Work directory path',
+                defaultValue: process.cwd(),
+            },
+            {
+                flags: '--source-dir <string>',
+                description: 'Source directory path',
+                defaultValue: 'src',
+            },
+            {
+                flags: '--output-dir <string>',
+                description: 'Output directory path',
+                defaultValue: 'dist',
+            },
+            {
+                flags: '--output-name <string>',
+                description: 'Output file name',
+                defaultValue: 'main',
+            },
+            {
+                flags: '--output-name-format <string>',
+                description: 'Ouptput file name format',
+                defaultValue: '[name].js',
+            },
+            {
+                flags: '--ts-project <string>',
+                description: 'Path for TypeScript config file',
+                defaultValue: 'tsconfig.json',
+            },
+            {
+                flags: '--debug',
+                description: 'Debug mode',
+                defaultValue: false,
+            },
+        ] as Option[]
+    ).forEach((item) => {
+        if (options?.hideOptions?.includes?.(item.flags.split(/\s+/g)[0])) return;
+        command.option(item.flags, item?.description, item?.defaultValue);
+    });
+
+    command.action((entry, commandOptions) => {
+        new Forge({
+            entry,
+            ...options,
+            ...commandOptions,
+        } as unknown as ForgeOptions).run();
+    });
+
     return command;
 };
