@@ -614,7 +614,7 @@ export class Forge {
             watcher.on('unlink', watchHandler);
         }
 
-        if (this.options?.clean) {
+        if (this.options?.clean && (['compile', 'none'] as AfterEmitAction[]).includes(afterEmitAction)) {
             this.inputOptions?.onLog?.('info', `Cleaning output directory: ${this.outputPath}`);
             _.attempt(() => fs.rmSync(this.outputPath, { recursive: true, force: true }));
             this.inputOptions?.onLog?.('info', 'Output directory cleaned');

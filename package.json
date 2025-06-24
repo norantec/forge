@@ -38,7 +38,7 @@
         "memfs": "^4.17.2",
         "terser-webpack-plugin": "^5.3.14",
         "type-fest": "^4.41.0",
-        "webpack": "^5.99.9",
+        "webpack": "5.97.1",
         "webpack-virtual-modules": "^0.6.2",
         "winston": "^3.17.0",
         "zod": "^3.25.67"
