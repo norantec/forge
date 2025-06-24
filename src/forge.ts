@@ -467,7 +467,7 @@ export class Forge {
                 ],
             },
             entry: {
-                [name!]: this.virtualEntryFilePath,
+                [this.options.outputName!]: this.virtualEntryFilePath,
             },
             target: 'node',
             mode: this.inputOptions?.getMode?.(context) ?? 'production',
