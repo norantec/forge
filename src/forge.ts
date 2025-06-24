@@ -443,6 +443,7 @@ export class Forge {
                             return {
                                 loader: require.resolve('esbuild-loader'),
                                 options: {
+                                    target: 'es5',
                                     tsconfig: path.resolve(this.options.workDir!, this.options.tsProject!),
                                 },
                             };
