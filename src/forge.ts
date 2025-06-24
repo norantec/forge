@@ -449,7 +449,12 @@ export class Forge {
                         new VirtualModulesPlugin({
                             [this.virtualEntryFilePath]: (() => {
                                 if (typeof this.inputOptions?.getEntryFileContent === 'function') {
-                                    return this.inputOptions.getEntryFileContent(context);
+                                    const content = this.inputOptions.getEntryFileContent(context);
+                                    if (StringUtil.isFalsyString(content)) {
+                                        return fs.readFileSync(this.entryFilePath).toString();
+                                    } else {
+                                        return content;
+                                    }
                                 }
                                 return fs.readFileSync(this.entryFilePath).toString();
                             })(),
