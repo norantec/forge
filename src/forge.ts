@@ -19,22 +19,22 @@ import { Command } from 'commander';
 import * as originalFs from 'fs';
 import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
-import { EventEmitter } from 'eventemitter3';
-
-const EMITTED = Symbol();
-const RUN = Symbol();
+import { fork } from 'node:child_process';
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
+
+const IS_FORKED = typeof process?.send === 'function';
 
 function renderProgressBar(percent, message, file) {
     const barLength = 40;
     const filledLength = Math.round((percent / 100) * barLength);
     const bar = `${'█'.repeat(filledLength)}${'-'.repeat(barLength - filledLength)}`;
+    const chalkInstance = new chalk.Instance({ level: 3 });
 
     readline.clearLine(process.stdout, 0);
     readline.cursorTo(process.stdout, 0);
     process.stdout.write(
-        `${chalk.green(`[${bar}]`)} ${chalk.yellow(`${percent}%`)} ${chalk.gray(message)} ${chalk.cyan(file)}`,
+        `${chalkInstance.green(`[${bar}]`)} ${chalkInstance.yellow(`${percent}%`)} ${chalkInstance.gray(message)} ${chalkInstance.cyan(file)}`,
     );
 
     if (percent === 100) {
@@ -264,6 +264,7 @@ const FORGE_OPTIONS_SCHEMA = z.object({
     clean: z.boolean().optional().default(true),
     debug: z.union([z.boolean().default(false), z.undefined()]),
     entry: z.union([z.string().default('main.ts'), z.undefined()]),
+    mode: z.union([z.enum(['development', 'production']).default('production'), z.undefined()]),
     outputDir: z.union([z.string().default('dist'), z.undefined()]),
     outputName: z.union([z.string().default('main'), z.undefined()]),
     outputNameFormat: z.union([z.string().default('[name].js'), z.undefined()]),
@@ -275,6 +276,13 @@ const FORGE_OPTIONS_SCHEMA = z.object({
 
 type ForgeBaseOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
 type AfterEmitAction = z.infer<typeof AFTER_EMIT_ACTION_SCHEMA>;
+
+const FORKED_FORGE_OPTIONS_ENV_NAME = 'FORKED_FORGE_OPTIONS';
+const FORKED_FORGE_OPTIONS_SCHEMA = z
+    .object({
+        entryFileContent: z.string(),
+    })
+    .merge(FORGE_OPTIONS_SCHEMA);
 
 export interface ForgeContext {
     entryDirPath: string;
@@ -288,7 +296,6 @@ export interface ForgeContext {
 export type ForgeOptions = ForgeBaseOptions & {
     getEntryFileContent?: (context: ForgeContext) => string;
     onLog?: LogHandler;
-    getMode?: (context: ForgeContext) => 'development' | 'production';
     onProgress?: (percentage: number, message: string, ...params: string[]) => void;
 };
 
@@ -299,9 +306,6 @@ export class Forge {
     protected entryDirPath: string;
     protected outputPath: string;
     protected virtualEntryFilePath: string;
-    protected readonly emitter = new EventEmitter();
-    protected compiler: webpack.Compiler | null = null;
-    protected worker: Worker | null = null;
 
     public constructor(private readonly inputOptions: ForgeOptions) {
         this.options = FORGE_OPTIONS_SCHEMA.parse(this.inputOptions);
@@ -329,65 +333,9 @@ export class Forge {
             this.entryDirPath,
             `virtual_${Math.random().toString(32).slice(2)}.ts`,
         );
-
-        if (this.options.afterEmitAction! === 'watch') {
-            const watchHandler = () => {
-                _.attempt(() => this.worker!.terminate());
-                this.worker = null;
-                _.attempt(() =>
-                    this.compiler!.close((error) => {
-                        if (!error && !this.compiler?.running) {
-                            this.compiler = null;
-                            this.emitter.emit(RUN);
-                        }
-                    }),
-                );
-            };
-            const ig = ignore().add(
-                (() => {
-                    const gitIgnorePath = path.resolve('.gitignore');
-                    if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
-                        return fs.readFileSync(gitIgnorePath).toString();
-                    }
-                    return '';
-                })(),
-            );
-            const watcher = chokidar.watch(process.cwd(), {
-                persistent: true,
-                ignoreInitial: true,
-                ignored: (pathname) => {
-                    const relativePath = path.relative(process.cwd(), pathname);
-                    if (StringUtil.isFalsyString(relativePath)) return false;
-                    if (relativePath.startsWith('.git')) return true;
-                    return ig.ignores(relativePath);
-                },
-            });
-            watcher.on('change', watchHandler);
-            watcher.on('add', watchHandler);
-            watcher.on('unlink', watchHandler);
-        }
-
-        this.emitter.addListener(EMITTED, (result: webpack.Stats | undefined) => {
-            if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-                const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(([fileName]) =>
-                    fileName?.endsWith?.('.js'),
-                )?.[1];
-
-                if (!bundleFileSource) {
-                    throw new Error('Cannot find any file to run');
-                }
-
-                this.worker = new Worker(bundleFileSource.buffer().toString(), {
-                    eval: true,
-                });
-            }
-        });
-        this.emitter.addListener(RUN, () => {
-            this.run();
-        });
     }
 
-    public run() {
+    public async run(): Promise<webpack.Stats | undefined> {
         const context: ForgeContext = {
             entryDirPath: this.entryDirPath,
             entryFilePath: this.entryFilePath,
@@ -396,127 +344,161 @@ export class Forge {
             tsConfig: this.tsConfig,
             virtualEntryFilePath: this.virtualEntryFilePath,
         };
-
-        if (StringUtil.isFalsyString(this.options.outputName!)) throw new Error(`Invalid generate type`);
-
-        const volume = new memfs.Volume() as memfs.IFs;
-        this.compiler = webpack({
-            cache: false,
-            optimization: {
-                minimize: false,
-                minimizer: [
-                    new TerserPlugin({
-                        terserOptions: {
-                            keep_classnames: true,
-                            keep_fnames: true,
+        const entryFileContent = (() => {
+            if (typeof this.inputOptions?.getEntryFileContent === 'function') {
+                const content = this.inputOptions.getEntryFileContent(context);
+                if (StringUtil.isFalsyString(content)) {
+                    return fs.readFileSync(this.entryFilePath).toString();
+                } else {
+                    return content;
+                }
+            }
+            return fs.readFileSync(this.entryFilePath).toString();
+        })();
+        if (!IS_FORKED && this.options.afterEmitAction! === 'watch') {
+            const createFork = async () => {
+                return new Promise((resolve) => {
+                    const childProcess = fork(__filename, {
+                        env: {
+                            [FORKED_FORGE_OPTIONS_ENV_NAME]: JSON.stringify({ ...this.options, entryFileContent }),
                         },
-                    }),
-                ],
-            },
-            entry: {
-                [this.options.outputName!]: this.virtualEntryFilePath,
-            },
-            target: 'node',
-            mode: this.inputOptions?.getMode?.(context) ?? 'production',
-            output: {
-                devtoolModuleFilenameTemplate: '[absolute-resource-path]',
-                filename: this.options.outputNameFormat,
-                path: this.outputPath,
-                libraryTarget: 'commonjs',
-            },
-            resolve: {
-                extensions: ['.js', '.cjs', '.mjs', '.ts', '.tsx'],
-                alias: {
-                    src: path.resolve(this.options.workDir!, this.options.sourceDir!),
-                    UNKNOWN: false,
-                },
-                plugins: [new CatchNotFoundPlugin(this.inputOptions?.onLog)],
-            },
-            module: {
-                rules: [
-                    {
-                        test: /\.ts$/,
-                        use: {
-                            loader: require.resolve('ts-loader'),
-                            options: {
-                                ...(StringUtil.isFalsyString(this.options?.tsCompiler)
-                                    ? {}
-                                    : { compiler: this.options.tsCompiler! }),
-                                configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
-                            },
-                        },
-                        exclude: /node_modules/,
+                        stdio: 'inherit',
+                    });
+                    childProcess.on('close', () => resolve(undefined));
+                    childProcess.on('error', () => resolve(undefined));
+                    childProcess.on('exit', () => resolve(undefined));
+                });
+            };
+            while (true) {
+                await createFork();
+            }
+        } else {
+            return new Promise<webpack.Stats>((resolve, reject) => {
+                if (
+                    this.options?.clean &&
+                    (['compile', 'none'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)
+                ) {
+                    this.inputOptions?.onLog?.('info', `Cleaning output directory: ${this.outputPath}`);
+                    _.attempt(() => fs.rmSync(this.outputPath, { recursive: true, force: true }));
+                    this.inputOptions?.onLog?.('info', 'Output directory cleaned');
+                }
+
+                if (StringUtil.isFalsyString(this.options.outputName!)) reject(new Error(`Invalid generate type`));
+
+                const volume = new memfs.Volume() as memfs.IFs;
+                const compiler = webpack({
+                    cache: false,
+                    optimization: {
+                        minimize: false,
+                        minimizer: [
+                            new TerserPlugin({
+                                terserOptions: {
+                                    keep_classnames: true,
+                                    keep_fnames: true,
+                                },
+                            }),
+                        ],
                     },
-                ],
-            },
-            plugins: [
-                new VirtualFilePlugin(volume),
-                new webpack.ProgressPlugin((percentage, message, ...args) => {
-                    if (typeof this.inputOptions?.onProgress === 'function') {
-                        this.inputOptions.onProgress(percentage, message, ...args);
-                    } else {
-                        renderProgressBar(Math.floor(percentage * 100), message, args[0] || '');
-                    }
-                }),
-                ...(() => {
-                    const result: any[] = [];
-
-                    result.push(
-                        new CleanNonJSFilePlugin(),
-                        new VirtualModulesPlugin({
-                            [this.virtualEntryFilePath]: (() => {
-                                if (typeof this.inputOptions?.getEntryFileContent === 'function') {
-                                    const content = this.inputOptions.getEntryFileContent(context);
-                                    if (StringUtil.isFalsyString(content)) {
-                                        return fs.readFileSync(this.entryFilePath).toString();
-                                    } else {
-                                        return content;
-                                    }
-                                }
-                                return fs.readFileSync(this.entryFilePath).toString();
-                            })(),
+                    entry: {
+                        [this.options.outputName!]: this.virtualEntryFilePath,
+                    },
+                    target: 'node',
+                    mode: this.options.mode!,
+                    output: {
+                        devtoolModuleFilenameTemplate: '[absolute-resource-path]',
+                        filename: this.options.outputNameFormat,
+                        path: this.outputPath,
+                        libraryTarget: 'commonjs',
+                    },
+                    resolve: {
+                        extensions: ['.js', '.cjs', '.mjs', '.ts', '.tsx'],
+                        alias: {
+                            src: path.resolve(this.options.workDir!, this.options.sourceDir!),
+                            UNKNOWN: false,
+                        },
+                        plugins: [new CatchNotFoundPlugin(this.inputOptions?.onLog)],
+                    },
+                    module: {
+                        rules: [
+                            {
+                                test: /\.ts$/,
+                                use: {
+                                    loader: require.resolve('ts-loader'),
+                                    options: {
+                                        ...(StringUtil.isFalsyString(this.options?.tsCompiler)
+                                            ? {}
+                                            : { compiler: this.options.tsCompiler! }),
+                                        configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
+                                    },
+                                },
+                                exclude: /node_modules/,
+                            },
+                        ],
+                    },
+                    plugins: [
+                        new VirtualFilePlugin(volume),
+                        new webpack.ProgressPlugin((percentage, message, ...args) => {
+                            if (typeof this.inputOptions?.onProgress === 'function') {
+                                this.inputOptions.onProgress(percentage, message, ...args);
+                            } else {
+                                renderProgressBar(Math.floor(percentage * 100), message, args[0] || '');
+                            }
                         }),
-                    );
+                        ...(() => {
+                            const result: any[] = [];
 
-                    if (
-                        !(['run-once', 'watch'] as AfterEmitAction[]).includes(this.options.afterEmitAction!) ||
-                        this.options?.debug
-                    ) {
-                        result.push(new ForceWriteBundlePlugin(this.outputPath));
-                        if (this.options?.debug) return result;
-                    }
+                            result.push(
+                                new CleanNonJSFilePlugin(),
+                                new VirtualModulesPlugin({
+                                    [this.virtualEntryFilePath]: entryFileContent,
+                                }),
+                            );
 
-                    if (this.options.afterEmitAction! === 'compile') {
-                        result.push(new CompilePlugin(this.outputPath, volume, this.options?.onLog));
-                    }
+                            if (
+                                !(['run-once', 'watch'] as AfterEmitAction[]).includes(this.options.afterEmitAction!) ||
+                                this.options?.debug
+                            ) {
+                                result.push(new ForceWriteBundlePlugin(this.outputPath));
+                                if (this.options?.debug) return result;
+                            }
 
-                    return result;
-                })(),
-            ],
-        });
+                            if (this.options.afterEmitAction! === 'compile') {
+                                result.push(new CompilePlugin(this.outputPath, volume, this.options?.onLog));
+                            }
 
-        const runCompiler = () => {
-            if (this.compiler instanceof webpack.Compiler) {
-                this.compiler.run((error, result) => {
+                            return result;
+                        })(),
+                    ],
+                });
+
+                compiler.run((error, result) => {
                     if (error) {
                         this.inputOptions?.onLog?.(
                             'error',
                             `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
                         );
-                    } else {
-                        this.emitter.emit(EMITTED, result);
+                        reject(error);
+                    } else if (result instanceof webpack.Stats) {
+                        // this.emitter.emit(EMITTED, result);
+                        if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
+                            const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(
+                                ([fileName]) => fileName?.endsWith?.('.js'),
+                            )?.[1];
+
+                            if (!(bundleFileSource instanceof webpack.sources.Source)) {
+                                return reject(new Error('Cannot find any bundl file'));
+                            }
+
+                            new Worker(bundleFileSource.buffer().toString(), {
+                                eval: true,
+                            });
+                        }
+
+                        resolve(result);
                     }
                 });
-            }
-        };
-
-        if (this.options?.clean && (['compile', 'none'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-            this.inputOptions?.onLog?.('info', `Cleaning output directory: ${this.outputPath}`);
-            _.attempt(() => fs.rmSync(this.outputPath, { recursive: true, force: true }));
-            this.inputOptions?.onLog?.('info', 'Output directory cleaned');
+            });
         }
-
-        runCompiler();
     }
 }
 
@@ -602,3 +584,40 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
 
     return command;
 };
+
+if (IS_FORKED) {
+    const handleChange = () => {
+        process.exit(0);
+    };
+    const ig = ignore().add(
+        (() => {
+            const gitIgnorePath = path.resolve('.gitignore');
+            if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
+                return fs.readFileSync(gitIgnorePath).toString();
+            }
+            return '';
+        })(),
+    );
+    const watcher = chokidar.watch(process.cwd(), {
+        persistent: true,
+        ignoreInitial: true,
+        ignored: (pathname) => {
+            const relativePath = path.relative(process.cwd(), pathname);
+            if (StringUtil.isFalsyString(relativePath)) return false;
+            if (relativePath.startsWith('.git')) return true;
+            return ig.ignores(relativePath);
+        },
+    });
+
+    watcher.on('change', handleChange);
+    watcher.on('add', handleChange);
+    watcher.on('unlink', handleChange);
+
+    const options = FORKED_FORGE_OPTIONS_SCHEMA.parse(
+        JSON.parse(process.env?.[FORKED_FORGE_OPTIONS_ENV_NAME] as string),
+    );
+    new Forge({
+        ..._.omit(options, ['entryFileContent']),
+        getEntryFileContent: () => options.entryFileContent,
+    }).run();
+}
