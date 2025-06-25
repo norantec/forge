@@ -357,16 +357,21 @@ export class Forge {
         })();
         if (!IS_FORKED && this.options.afterEmitAction! === 'watch') {
             const createFork = async () => {
-                return new Promise((resolve) => {
+                return new Promise((resolve, reject) => {
                     const childProcess = fork(__filename, {
                         env: {
                             [FORKED_FORGE_OPTIONS_ENV_NAME]: JSON.stringify({ ...this.options, entryFileContent }),
                         },
                         stdio: 'inherit',
                     });
-                    childProcess.on('close', () => resolve(undefined));
-                    childProcess.on('error', () => resolve(undefined));
-                    childProcess.on('exit', () => resolve(undefined));
+                    childProcess.on('error', (error) => reject(error));
+                    childProcess.on('exit', (code) => {
+                        if (typeof code === 'number' && code !== 0) {
+                            reject(new Error(`Watch process exited with code ${code}`));
+                        } else {
+                            resolve(undefined);
+                        }
+                    });
                 });
             };
             while (true) {
@@ -619,5 +624,9 @@ if (IS_FORKED) {
     new Forge({
         ..._.omit(options, ['entryFileContent']),
         getEntryFileContent: () => options.entryFileContent,
-    }).run();
+    })
+        .run()
+        .catch(() => {
+            process.exit(1);
+        });
 }
