@@ -20,6 +20,7 @@ import * as originalFs from 'fs';
 import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
 import { fork } from 'node:child_process';
+import { LogUtil } from '@open-norantec/utilities/dist/log-util.class';
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
@@ -262,9 +263,10 @@ const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none']
 
 const FORGE_OPTIONS_SCHEMA = z.object({
     afterEmitAction: z.union([AFTER_EMIT_ACTION_SCHEMA, z.undefined()]),
-    clean: z.boolean().optional().default(true),
+    clean: z.union([z.boolean().default(true), z.undefined()]),
     debug: z.union([z.boolean().default(false), z.undefined()]),
     entry: z.union([z.string().default('main.ts'), z.undefined()]),
+    logLevel: z.union([SchemaUtil.LOG_LEVEL.default('info'), z.literal(false), z.undefined()]),
     mode: z.union([z.enum(['development', 'production']).default('production'), z.undefined()]),
     outputDir: z.union([z.string().default('dist'), z.undefined()]),
     outputName: z.union([z.string().default('main'), z.undefined()]),
@@ -380,7 +382,7 @@ export class Forge {
                             const message = MESSAGE_SCHEMA.parse(messageData);
                             switch (message.type) {
                                 case 'log': {
-                                    this.inputOptions?.onLog?.(message.level, message.message);
+                                    this.handleLog(message.level, message.message);
                                     break;
                                 }
                                 default:
@@ -407,9 +409,9 @@ export class Forge {
                     this.options?.clean &&
                     (['compile', 'none'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)
                 ) {
-                    this.inputOptions?.onLog?.('info', `Cleaning output directory: ${this.outputPath}`);
+                    this.handleLog('info', `Cleaning output directory: ${this.outputPath}`);
                     _.attempt(() => fs.rmSync(this.outputPath, { recursive: true, force: true }));
-                    this.inputOptions?.onLog?.('info', 'Output directory cleaned');
+                    this.handleLog('info', 'Output directory cleaned');
                 }
 
                 if (StringUtil.isFalsyString(this.options.outputName!)) reject(new Error(`Invalid generate type`));
@@ -445,7 +447,11 @@ export class Forge {
                             src: path.resolve(this.options.workDir!, this.options.sourceDir!),
                             UNKNOWN: false,
                         },
-                        plugins: [new CatchNotFoundPlugin(this.inputOptions?.onLog)],
+                        plugins: [
+                            new CatchNotFoundPlugin((level, message) => {
+                                this.handleLog(level, message);
+                            }),
+                        ],
                     },
                     module: {
                         rules: [
@@ -492,7 +498,11 @@ export class Forge {
                             }
 
                             if (this.options.afterEmitAction! === 'compile') {
-                                result.push(new CompilePlugin(this.outputPath, volume, this.options?.onLog));
+                                result.push(
+                                    new CompilePlugin(this.outputPath, volume, (level, message) => {
+                                        this.handleLog(level, message);
+                                    }),
+                                );
                             }
 
                             return result;
@@ -502,7 +512,7 @@ export class Forge {
 
                 compiler.run((error, result) => {
                     if (error) {
-                        this.inputOptions?.onLog?.(
+                        this.handleLog(
                             'error',
                             `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
                         );
@@ -527,6 +537,12 @@ export class Forge {
                     }
                 });
             });
+        }
+    }
+
+    private handleLog(logLevel: Schema.LogLevel, message?: string) {
+        if (new LogUtil().match(this.options.logLevel!, logLevel)) {
+            this.inputOptions?.onLog?.(logLevel, message);
         }
     }
 }
@@ -596,6 +612,11 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
                 flags: '--debug',
                 description: 'Debug mode',
                 defaultValue: false,
+            },
+            {
+                flags: '--log-level',
+                description: 'Log level',
+                defaultValue: 'info',
             },
         ] as Option[]
     ).forEach((item) => {
