@@ -14,7 +14,7 @@ import * as chokidar from 'chokidar';
 import * as ignore from 'ignore';
 import * as readline from 'node:readline';
 import * as chalk from 'chalk';
-import { Schema } from '@open-norantec/utilities/dist/schema-util.class';
+import { Schema, SchemaUtil } from '@open-norantec/utilities/dist/schema-util.class';
 import { Command } from 'commander';
 import * as originalFs from 'fs';
 import * as originalFsPromises from 'fs/promises';
@@ -53,6 +53,7 @@ class VirtualFilePlugin {
 class CatchNotFoundPlugin {
     public constructor(private onLog?: LogHandler) {}
     public apply(resolver: webpack.Resolver) {
+        const onLog = this.onLog;
         const resolve = resolver.resolve;
         resolver.resolve = function (context: Record<string, any>, currentPath, request, resolveContext, callback) {
             const self: CatchNotFoundPlugin = this;
@@ -87,7 +88,7 @@ class CatchNotFoundPlugin {
                         },
                     );
                 }
-                self?.onLog?.('warn', `Notfound '${context.issuer}' from '${request}', skipping...`);
+                onLog?.('verbose', `Notfound '${context.issuer}' from '${request}', skipping...`);
                 // make not found errors runtime errors
                 callback(null, notfoundPathname, {
                     path: result,
@@ -284,6 +285,16 @@ const FORKED_FORGE_OPTIONS_SCHEMA = z
     })
     .merge(FORGE_OPTIONS_SCHEMA);
 
+const MESSAGE_SCHEMA = z.discriminatedUnion('type', [
+    z.object({
+        type: z.literal('log'),
+        level: SchemaUtil.LOG_LEVEL,
+        message: z.string().optional(),
+    }),
+]);
+
+type Message = z.infer<typeof MESSAGE_SCHEMA>;
+
 export interface ForgeContext {
     entryDirPath: string;
     entryFilePath: string;
@@ -363,6 +374,19 @@ export class Forge {
                             [FORKED_FORGE_OPTIONS_ENV_NAME]: JSON.stringify({ ...this.options, entryFileContent }),
                         },
                         stdio: 'inherit',
+                    });
+                    childProcess.on('message', (messageData) => {
+                        try {
+                            const message = MESSAGE_SCHEMA.parse(messageData);
+                            switch (message.type) {
+                                case 'log': {
+                                    this.inputOptions?.onLog?.(message.level, message.message);
+                                    break;
+                                }
+                                default:
+                                    break;
+                            }
+                        } catch {}
                     });
                     childProcess.on('error', (error) => reject(error));
                     childProcess.on('exit', (code) => {
@@ -590,7 +614,7 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
     return command;
 };
 
-if (IS_FORKED) {
+if (IS_FORKED && require.main === module) {
     const handleChange = () => {
         process.exit(0);
     };
@@ -624,6 +648,13 @@ if (IS_FORKED) {
     new Forge({
         ..._.omit(options, ['entryFileContent']),
         getEntryFileContent: () => options.entryFileContent,
+        onLog: (level, message) => {
+            process.send!({
+                type: 'log',
+                level,
+                message,
+            } as Message);
+        },
     })
         .run()
         .catch(() => {
