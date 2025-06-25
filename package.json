@@ -28,12 +28,10 @@
     },
     "homepage": "https://github.com/norantec/forge#readme",
     "dependencies": {
-        "@open-norantec/herbal": "^1.0.0-alpha.13",
         "@open-norantec/utilities": "^1.0.0-alpha.19",
         "@yao-pkg/pkg": "^6.5.1",
         "chokidar": "^3.6.0",
         "commander": "^12.0.0",
-        "esbuild-loader": "^3.2.0",
         "eventemitter3": "^5.0.1",
         "fs-extra": "^11.1.1",
         "ignore": "^7.0.5",

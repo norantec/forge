@@ -256,11 +256,11 @@ const FORGE_OPTIONS_SCHEMA = z.object({
     clean: z.boolean().optional().default(true),
     debug: z.union([z.boolean().default(false), z.undefined()]),
     entry: z.union([z.string().default('main.ts'), z.undefined()]),
-    esbuild: z.union([z.boolean().default(true), z.undefined()]),
     outputDir: z.union([z.string().default('dist'), z.undefined()]),
     outputName: z.union([z.string().default('main'), z.undefined()]),
     outputNameFormat: z.union([z.string().default('[name].js'), z.undefined()]),
     sourceDir: z.union([z.string().default('src'), z.undefined()]),
+    tsCompiler: z.string().optional(),
     tsProject: z.union([z.string().default('tsconfig.json'), z.undefined()]),
     workDir: z.union([z.string().default(process.cwd()), z.undefined()]),
 });
@@ -428,26 +428,15 @@ export class Forge {
                 rules: [
                     {
                         test: /\.ts$/,
-                        use: (() => {
-                            if (!this.options?.esbuild) {
-                                return {
-                                    loader: require.resolve('ts-loader'),
-                                    options: {
-                                        compiler: require.resolve('ts-patch/compiler', {
-                                            paths: [__dirname, process.cwd()],
-                                        }),
-                                        configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
-                                    },
-                                };
-                            }
-                            return {
-                                loader: require.resolve('esbuild-loader'),
-                                options: {
-                                    target: 'es2017',
-                                    tsconfig: path.resolve(this.options.workDir!, this.options.tsProject!),
-                                },
-                            };
-                        })(),
+                        use: {
+                            loader: require.resolve('ts-loader'),
+                            options: {
+                                ...(StringUtil.isFalsyString(this.options?.tsCompiler)
+                                    ? {}
+                                    : { compiler: this.options.tsCompiler! }),
+                                configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
+                            },
+                        },
                         exclude: /node_modules/,
                     },
                 ],
@@ -580,13 +569,12 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
                 defaultValue: 'tsconfig.json',
             },
             {
-                flags: '--debug',
-                description: 'Debug mode',
-                defaultValue: false,
+                flags: '--ts-compiler <string>',
+                description: 'Path or module name for TypeScript compiler',
             },
             {
-                flags: '--esbuild',
-                description: 'Use ESBuild to speed up compilation',
+                flags: '--debug',
+                description: 'Debug mode',
                 defaultValue: false,
             },
         ] as Option[]
