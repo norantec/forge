@@ -30,6 +30,7 @@
     "dependencies": {
         "@open-norantec/utilities": "^1.0.0-alpha.19",
         "@yao-pkg/pkg": "^6.5.1",
+        "ajv": "^8.17.1",
         "chokidar": "^3.6.0",
         "commander": "^12.0.0",
         "eventemitter3": "^5.0.1",
@@ -38,6 +39,7 @@
         "lodash": "^4.17.21",
         "memfs": "^4.17.2",
         "terser-webpack-plugin": "^5.3.14",
+        "ts-loader": "^9.5.2",
         "type-fest": "^4.41.0",
         "webpack": "5.97.1",
         "webpack-virtual-modules": "^0.6.2",

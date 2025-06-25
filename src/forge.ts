@@ -42,6 +42,14 @@ function renderProgressBar(percent, message, file) {
     }
 }
 
+class VirtualFilePlugin {
+    public constructor(private readonly volume: memfs.IFs) {}
+
+    public apply(compiler: webpack.Compiler) {
+        compiler.outputFileSystem = this.volume as webpack.OutputFileSystem;
+    }
+}
+
 class CatchNotFoundPlugin {
     public constructor(private onLog?: LogHandler) {}
     public apply(resolver: webpack.Resolver) {
@@ -442,6 +450,7 @@ export class Forge {
                 ],
             },
             plugins: [
+                new VirtualFilePlugin(volume),
                 new webpack.ProgressPlugin((percentage, message, ...args) => {
                     if (typeof this.inputOptions?.onProgress === 'function') {
                         this.inputOptions.onProgress(percentage, message, ...args);
