@@ -578,6 +578,11 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
                 defaultValue: true,
             },
             {
+                flags: '--mode',
+                description: 'Compile mode, e.g. development/production',
+                defaultValue: 'production',
+            },
+            {
                 flags: '--work-dir <string>',
                 description: 'Work directory path',
                 defaultValue: process.cwd(),
