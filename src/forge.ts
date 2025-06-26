@@ -518,19 +518,22 @@ export class Forge {
                         );
                         reject(error);
                     } else if (result instanceof webpack.Stats) {
-                        // this.emitter.emit(EMITTED, result);
                         if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-                            const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(
+                            const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(
                                 ([fileName]) => fileName?.endsWith?.('.js'),
-                            )?.[1];
+                            )?.[0];
 
-                            if (!(bundleFileSource instanceof webpack.sources.Source)) {
-                                return reject(new Error('Cannot find any bundl file'));
+                            if (StringUtil.isFalsyString(bundleFileSourceFilename)) {
+                                return reject(new Error('Cannot find any bundle file'));
                             }
 
-                            new Worker(bundleFileSource.buffer().toString(), {
-                                eval: true,
-                            });
+                            const source = volume
+                                .readFileSync(path.resolve(this.outputPath, bundleFileSourceFilename!))
+                                ?.toString?.();
+
+                            if (StringUtil.isFalsyString(source)) return resolve(result);
+
+                            new Worker(source, { eval: true });
                         }
 
                         resolve(result);
@@ -678,7 +681,12 @@ if (IS_FORKED && require.main === module) {
         },
     })
         .run()
-        .catch(() => {
+        .catch((error) => {
+            process.send!({
+                type: 'log',
+                level: 'error',
+                message: error?.message,
+            } as Message);
             process.exit(1);
         });
 }
