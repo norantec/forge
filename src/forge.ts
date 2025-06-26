@@ -580,7 +580,6 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
             {
                 flags: '--mode',
                 description: 'Compile mode, e.g. development/production',
-                defaultValue: 'production',
             },
             {
                 flags: '--work-dir <string>',
