@@ -519,21 +519,33 @@ export class Forge {
                         reject(error);
                     } else if (result instanceof webpack.Stats) {
                         if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-                            const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(
-                                ([fileName]) => fileName?.endsWith?.('.js'),
-                            )?.[0];
+                            let sourceCode: string | null = null;
 
-                            if (StringUtil.isFalsyString(bundleFileSourceFilename)) {
-                                return reject(new Error('Cannot find any bundle file'));
+                            if (this.options.mode === 'development') {
+                                const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(
+                                    ([fileName]) => fileName?.endsWith?.('.js'),
+                                )?.[0];
+                                try {
+                                    sourceCode = volume
+                                        .readFileSync(path.resolve(this.outputPath, bundleFileSourceFilename!))
+                                        ?.toString?.();
+                                } catch {}
+                            } else if (this.options.mode === 'production') {
+                                const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(
+                                    ([fileName]) => fileName?.endsWith?.('.js'),
+                                )?.[1];
+                                try {
+                                    sourceCode = bundleFileSource!.buffer().toString();
+                                } catch (e) {
+                                    console.log(e);
+                                }
                             }
 
-                            const source = volume
-                                .readFileSync(path.resolve(this.outputPath, bundleFileSourceFilename!))
-                                ?.toString?.();
+                            if (StringUtil.isFalsyString(sourceCode)) {
+                                return reject(new Error('Cannot find any file to run'));
+                            }
 
-                            if (StringUtil.isFalsyString(source)) return resolve(result);
-
-                            new Worker(source, { eval: true });
+                            new Worker(sourceCode!, { eval: true });
                         }
 
                         resolve(result);
