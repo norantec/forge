@@ -590,7 +590,7 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
                 defaultValue: true,
             },
             {
-                flags: '--mode',
+                flags: '--mode <string>',
                 description: 'Compile mode, e.g. development/production',
             },
             {
