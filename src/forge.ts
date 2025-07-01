@@ -431,7 +431,8 @@ export class Forge {
                         ],
                     },
                     entry: {
-                        [this.options.outputName!]: this.virtualEntryFilePath,
+                        [`${this.options.outputName!}${this.options.afterEmitAction! === 'compile' ? `-${process.arch}` : ''}`]:
+                            this.virtualEntryFilePath,
                     },
                     target: 'node',
                     mode: this.options.mode!,
