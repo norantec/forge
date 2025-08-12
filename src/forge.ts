@@ -59,7 +59,7 @@ class CatchNotFoundPlugin {
         resolver.resolve = function (context: Record<string, any>, currentPath, request, resolveContext, callback) {
             const self: CatchNotFoundPlugin = this;
             resolve.call(self, context, currentPath, request, resolveContext, (error, innerPath, result) => {
-                const notfoundPathname = path.resolve(__dirname, '../../preserved/@@notfound.js') + `?${request}`;
+                const notfoundPathname = path.resolve(__dirname, '../preserved/@@notfound.js') + `?${request}`;
                 if (result) {
                     return callback(null, innerPath, result);
                 }
@@ -136,7 +136,7 @@ class ForceWriteBundlePlugin {
                         _.attempt(() => {
                             fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
                         });
-                        fs.writeFileSync(absolutePath, asset?.buffer?.());
+                        fs.writeFileSync(absolutePath, asset?.buffer?.() as NodeJS.ArrayBufferView);
                     });
                 },
             );
