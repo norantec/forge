@@ -477,9 +477,8 @@ export class Forge {
                     plugins: [
                         new ForkTsCheckerPlugin({
                             async: false,
-                            typescript: {
-                                configFile: this.options.tsProject,
-                            },
+                            tsconfig: this.options.tsProject,
+                            silent: false,
                         }),
                         new VirtualFilePlugin(volume),
                         new webpack.ProgressPlugin((percentage, message, ...args) => {
