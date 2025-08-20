@@ -356,6 +356,30 @@ export class Forge {
             tsConfig: this.tsConfig,
             virtualEntryFilePath: this.virtualEntryFilePath,
         };
+        {
+            const diagnostics = ts.getPreEmitDiagnostics(
+                ts.createProgram({
+                    rootNames: this.tsConfig.fileNames,
+                    options: this.tsConfig.options,
+                }),
+            );
+            if (diagnostics?.length > 0) {
+                diagnostics.forEach((diagnostic) => {
+                    const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n');
+                    if (diagnostic.file) {
+                        const { line, character } = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start!);
+                        const fileName = path.relative(process.cwd(), diagnostic.file.fileName);
+                        this.inputOptions?.onLog?.(
+                            'error',
+                            `❌ ${fileName} (${line + 1},${character + 1}): ${message}`,
+                        );
+                    } else {
+                        this.inputOptions?.onLog?.('error', `❌ ${message}`);
+                    }
+                });
+                return;
+            }
+        }
         const entryFileContent = (() => {
             if (typeof this.inputOptions?.getEntryFileContent === 'function') {
                 const content = this.inputOptions.getEntryFileContent(context);
@@ -537,9 +561,7 @@ export class Forge {
                                 )?.[1];
                                 try {
                                     sourceCode = bundleFileSource!.buffer().toString();
-                                } catch (e) {
-                                    console.log(e);
-                                }
+                                } catch {}
                             }
 
                             if (StringUtil.isFalsyString(sourceCode)) {
