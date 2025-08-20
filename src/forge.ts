@@ -420,6 +420,7 @@ export class Forge {
                 const volume = new memfs.Volume() as memfs.IFs;
                 const compiler = webpack({
                     cache: false,
+                    bail: true,
                     optimization: {
                         minimize: false,
                         minimizer: [
@@ -476,6 +477,9 @@ export class Forge {
                     plugins: [
                         new ForkTsCheckerPlugin({
                             async: false,
+                            typescript: {
+                                configFile: this.options.tsProject,
+                            },
                         }),
                         new VirtualFilePlugin(volume),
                         new webpack.ProgressPlugin((percentage, message, ...args) => {
