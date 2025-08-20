@@ -31,6 +31,7 @@
         "@open-norantec/utilities": "^1.0.0-alpha.20",
         "@yao-pkg/pkg": "^6.5.1",
         "ajv": "^8.17.1",
+        "chalk": "^5.6.0",
         "chokidar": "^3.6.0",
         "commander": "^12.0.0",
         "fork-ts-checker-webpack-plugin": "^4.1.6",
