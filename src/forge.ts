@@ -30,11 +30,12 @@ function renderProgressBar(percent, message, file) {
     const barLength = 40;
     const filledLength = Math.round((percent / 100) * barLength);
     const bar = `${'█'.repeat(filledLength)}${'-'.repeat(barLength - filledLength)}`;
+    const chalkInstance = new chalk.Chalk({ level: 3 });
 
     readline.clearLine(process.stdout, 0);
     readline.cursorTo(process.stdout, 0);
     process.stdout.write(
-        `${chalk.default.green(`[${bar}]`)} ${chalk.default.yellow(`${percent}%`)} ${chalk.default.gray(message)} ${chalk.default.cyan(file)}`,
+        `${chalkInstance.green(`[${bar}]`)} ${chalkInstance.yellow(`${percent}%`)} ${chalkInstance.gray(message)} ${chalkInstance.cyan(file)}`,
     );
 
     if (percent === 100) {
@@ -356,7 +357,8 @@ export class Forge {
             tsConfig: this.tsConfig,
             virtualEntryFilePath: this.virtualEntryFilePath,
         };
-        {
+
+        if (this.options.mode === 'production') {
             const diagnostics = ts.getPreEmitDiagnostics(
                 ts.createProgram({
                     rootNames: this.tsConfig.fileNames,
@@ -380,6 +382,7 @@ export class Forge {
                 return;
             }
         }
+
         const entryFileContent = (() => {
             if (typeof this.inputOptions?.getEntryFileContent === 'function') {
                 const content = this.inputOptions.getEntryFileContent(context);
