@@ -21,7 +21,6 @@ import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
 import { fork } from 'node:child_process';
 import { LogUtil } from '@open-norantec/utilities/dist/log-util.class';
-import ForkTsCheckerPlugin = require('fork-ts-checker-webpack-plugin');
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
@@ -462,7 +461,6 @@ export class Forge {
                                 use: {
                                     loader: require.resolve('ts-loader'),
                                     options: {
-                                        transpileOnly: true,
                                         ...(StringUtil.isFalsyString(this.options?.tsCompiler)
                                             ? {}
                                             : { compiler: this.options.tsCompiler! }),
@@ -474,11 +472,6 @@ export class Forge {
                         ],
                     },
                     plugins: [
-                        new ForkTsCheckerPlugin({
-                            async: false,
-                            tsconfig: this.options.tsProject,
-                            silent: false,
-                        }),
                         new VirtualFilePlugin(volume),
                         new webpack.ProgressPlugin((percentage, message, ...args) => {
                             if (typeof this.inputOptions?.onProgress === 'function') {
