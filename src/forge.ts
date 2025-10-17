@@ -546,7 +546,7 @@ export class Forge {
                     const getSourceCode = () => {
                         let sourceCode: string | null = null;
 
-                        if (this.options.mode === 'development') {
+                        if (this.options.mode === 'development' || this.options.afterEmitAction === 'disable-writing') {
                             const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(
                                 ([fileName]) => fileName?.endsWith?.('.js'),
                             )?.[0];
