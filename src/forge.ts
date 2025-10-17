@@ -259,7 +259,7 @@ class CompilePlugin {
     }
 }
 
-const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none']).default('none');
+const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none', 'disable-writing']).default('none');
 
 const FORGE_OPTIONS_SCHEMA = z.object({
     afterEmitAction: z.union([AFTER_EMIT_ACTION_SCHEMA, z.undefined()]),
@@ -308,6 +308,7 @@ export interface ForgeContext {
 
 export type ForgeOptions = ForgeBaseOptions & {
     getEntryFileContent?: (context: ForgeContext) => string;
+    onFile?: (content: Buffer) => void | Promise<void>;
     onLog?: LogHandler;
     onProgress?: (percentage: number, message: string, ...params: string[]) => void;
 };
@@ -394,6 +395,7 @@ export class Forge {
             }
             return fs.readFileSync(this.entryFilePath).toString();
         })();
+
         if (!IS_FORKED && this.options.afterEmitAction! === 'watch') {
             const createFork = async () => {
                 return new Promise((resolve, reject) => {
@@ -518,7 +520,9 @@ export class Forge {
                             );
 
                             if (
-                                !(['run-once', 'watch'] as AfterEmitAction[]).includes(this.options.afterEmitAction!) ||
+                                !(['run-once', 'watch', 'disable-writing'] as AfterEmitAction[]).includes(
+                                    this.options.afterEmitAction!,
+                                ) ||
                                 this.options?.debug
                             ) {
                                 result.push(new ForceWriteBundlePlugin(this.outputPath));
@@ -539,6 +543,29 @@ export class Forge {
                 });
 
                 compiler.run((error, result) => {
+                    const getSourceCode = () => {
+                        let sourceCode: string | null = null;
+
+                        if (this.options.mode === 'development') {
+                            const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(
+                                ([fileName]) => fileName?.endsWith?.('.js'),
+                            )?.[0];
+                            try {
+                                sourceCode = volume
+                                    .readFileSync(path.resolve(this.outputPath, bundleFileSourceFilename!))
+                                    ?.toString?.();
+                            } catch {}
+                        } else if (this.options.mode === 'production') {
+                            const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(
+                                ([fileName]) => fileName?.endsWith?.('.js'),
+                            )?.[1];
+                            try {
+                                sourceCode = bundleFileSource!.buffer().toString();
+                            } catch {}
+                        }
+
+                        return sourceCode;
+                    };
                     if (error) {
                         this.handleLog(
                             'error',
@@ -546,32 +573,32 @@ export class Forge {
                         );
                         reject(error);
                     } else if (result instanceof webpack.Stats) {
-                        if ((['watch', 'run-once'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-                            let sourceCode: string | null = null;
+                        switch (this.options.afterEmitAction!) {
+                            case 'watch':
+                            case 'run-once': {
+                                const sourceCode = getSourceCode();
 
-                            if (this.options.mode === 'development') {
-                                const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(
-                                    ([fileName]) => fileName?.endsWith?.('.js'),
-                                )?.[0];
-                                try {
-                                    sourceCode = volume
-                                        .readFileSync(path.resolve(this.outputPath, bundleFileSourceFilename!))
-                                        ?.toString?.();
-                                } catch {}
-                            } else if (this.options.mode === 'production') {
-                                const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(
-                                    ([fileName]) => fileName?.endsWith?.('.js'),
-                                )?.[1];
-                                try {
-                                    sourceCode = bundleFileSource!.buffer().toString();
-                                } catch {}
+                                if (StringUtil.isFalsyString(sourceCode)) {
+                                    return reject(new Error('Cannot find any file to run'));
+                                }
+
+                                new Worker(sourceCode!, { eval: true });
+
+                                break;
                             }
+                            case 'disable-writing': {
+                                const sourceCode = getSourceCode();
 
-                            if (StringUtil.isFalsyString(sourceCode)) {
-                                return reject(new Error('Cannot find any file to run'));
+                                if (StringUtil.isFalsyString(sourceCode)) {
+                                    return reject(new Error('Cannot find any file to run'));
+                                }
+
+                                this.inputOptions?.onFile?.(Buffer.from(sourceCode!));
+
+                                break;
                             }
-
-                            new Worker(sourceCode!, { eval: true });
+                            default:
+                                break;
                         }
 
                         resolve(result);
