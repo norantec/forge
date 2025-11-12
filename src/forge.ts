@@ -694,8 +694,8 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
         defaultValue: 'info',
       },
       {
-        flags: '--definition <string>',
-        description: 'Path for definition JSON file',
+        flags: '--definitions <string>',
+        description: 'Path for definitions JSON file',
       },
     ] as Option[]
   ).forEach((item) => {
