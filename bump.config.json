@@ -1,6 +1,6 @@
 {
-    "adapter": "npm",
-    "options": {
-        "token": "{{env.NPM_TOKEN}}"
-    }
+  "adapter": "npm",
+  "options": {
+    "token": "{{env.NPM_TOKEN}}"
+  }
 }
