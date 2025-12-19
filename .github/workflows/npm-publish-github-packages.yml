@@ -7,7 +7,7 @@ on:
       - master
       - alpha
       - beta
-      - released
+      - release
 
 jobs:
   build:
@@ -38,7 +38,7 @@ jobs:
         if: |
           github.ref == 'refs/heads/alpha' ||
           github.ref == 'refs/heads/beta' ||
-          github.ref == 'refs/heads/released'
+          github.ref == 'refs/heads/release'
         with:
           key: cache-${{ github.run_id }}
           path: cache.zip
@@ -52,7 +52,7 @@ jobs:
     if: |
       github.ref == 'refs/heads/alpha' ||
       github.ref == 'refs/heads/beta' ||
-      github.ref == 'refs/heads/released'
+      github.ref == 'refs/heads/release'
 
     steps:
       - name: Checkout code
