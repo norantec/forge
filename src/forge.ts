@@ -406,6 +406,7 @@ export class Forge {
         return new Promise((resolve, reject) => {
           const childProcess = fork(__filename, {
             env: {
+              ...process.env,
               [FORKED_FORGE_OPTIONS_ENV_NAME]: JSON.stringify({ ...this.options, entryFileContent }),
             },
             stdio: 'inherit',
