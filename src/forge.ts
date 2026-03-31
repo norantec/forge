@@ -262,6 +262,7 @@ const FORGE_OPTIONS_SCHEMA = z.object({
   afterEmitAction: z.union([AFTER_EMIT_ACTION_SCHEMA, z.undefined()]),
   clean: z.union([z.boolean().default(true), z.undefined()]),
   debug: z.union([z.boolean().default(false), z.undefined()]),
+  define: z.union([z.array(z.string()).default([]), z.undefined()]),
   definitions: z.union([z.string(), z.undefined()]),
   entry: z.union([z.string().default('main.ts'), z.undefined()]),
   logLevel: z.union([SchemaUtil.LOG_LEVEL.default('info'), z.literal(false), z.undefined()]),
@@ -355,6 +356,19 @@ export class Forge {
         );
       }
     } catch {}
+
+    if (Array.isArray(this.options.define)) {
+      this.options.define!.forEach((defineString) => {
+        try {
+          const [rawKey, rawValue] = defineString.split(/\s*\:\s*/g);
+          const key = JSON.parse(rawKey);
+          const value = JSON.parse(rawValue);
+          this.definitions[key] = JSON.stringify(value);
+        } catch {}
+      });
+    }
+
+    this.handleLog('info', `Use definitions: ${JSON.stringify(this.definitions)}`);
   }
 
   public async run(): Promise<webpack.Stats | undefined> {
@@ -626,7 +640,12 @@ export interface CreateForgeCommandOptions extends Partial<ForgeOptions> {
 interface Option {
   flags: string;
   defaultValue?: string | boolean | string[];
-  description?: string;
+  description: string;
+  parser?: (value: string, previous: string[]) => any;
+}
+
+function collect(value: string, previous: string[]) {
+  return Array.isArray(previous) ? previous.concat(value.split(',')) : [value];
 }
 
 export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
@@ -698,10 +717,20 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
         flags: '--definitions <string>',
         description: 'Path for definitions JSON file',
       },
+      {
+        flags: '--define <string>',
+        description: 'Define a single definition, e.g. --define FOO=1, prior to --definitions',
+        parser: collect,
+      },
     ] as Option[]
   ).forEach((item) => {
     if (options?.hideOptions?.includes?.(item.flags.split(/\s+/g)[0])) return;
-    command.option(item.flags, item?.description, item?.defaultValue);
+    command.option(
+      item.flags,
+      item.description,
+      typeof item.parser === 'function' ? item.parser : (values) => values,
+      item?.defaultValue,
+    );
   });
 
   command.action((entry, commandOptions) => {

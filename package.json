@@ -28,7 +28,7 @@
   },
   "homepage": "https://github.com/norantec/forge#readme",
   "dependencies": {
-    "@open-norantec/utilities": "^1.0.0-alpha.20",
+    "@open-norantec/utilities": "^1.0.1-alpha.15",
     "@yao-pkg/pkg": "^6.5.1",
     "ajv": "^8.17.1",
     "chalk": "^5.6.0",
