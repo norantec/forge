@@ -134,15 +134,17 @@ jobs:
 
       - name: Release with semantic-release
         env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ env.NPM_TOKEN }}
           BRANCH_NAME: ${{ github.ref_name }}
         run: nttc bump --type $BRANCH_NAME --config ./bump.config.json
 
       - name: Prepare NPMRC
+        env:
+          NPM_TOKEN: ${{ env.NPM_TOKEN }}
         run: |
           echo "always-auth=true" >> ./.npmrc
           echo "@open-norantec:registry=https://registry.npmjs.org" >> ./.npmrc
-          echo "//registry.npmjs.org/:_authToken=${{ secrets.NPM_TOKEN }}" >> ./.npmrc
+          echo "//registry.npmjs.org/:_authToken=${{ env.NPM_TOKEN }}" >> ./.npmrc
 
       - name: Publish package
         run: npm publish
