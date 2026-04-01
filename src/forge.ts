@@ -21,12 +21,32 @@ import * as originalFsPromises from 'fs/promises';
 import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
 import { fork } from 'node:child_process';
 import { LogUtil } from '@open-norantec/utilities/dist/log-util.class';
+import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
+import * as requireFromString from 'require-from-string';
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
 const IS_FORKED = typeof process?.send === 'function';
 
-function renderProgressBar(percent, message, file) {
+function loadObfuscatorConfig(obfuscatorConfigFilePath: string): ObfuscatorOptions {
+  if (StringUtil.isFalsyString(obfuscatorConfigFilePath)) return {};
+
+  const absoluteObfuscatorConfigFilePath = path.resolve(obfuscatorConfigFilePath!);
+
+  if (!fs.existsSync(absoluteObfuscatorConfigFilePath) || !fs.statSync(absoluteObfuscatorConfigFilePath).isFile()) {
+    return {};
+  }
+
+  const obfuscatorConfig = _.attempt(() =>
+    requireFromString(fs.readFileSync(absoluteObfuscatorConfigFilePath).toString()),
+  );
+
+  if (obfuscatorConfig instanceof Error) return {};
+
+  return obfuscatorConfig;
+}
+
+function renderProgressBar(percent: number, message: string, file: string) {
   const barLength = 40;
   const filledLength = Math.round((percent / 100) * barLength);
   const bar = `${'='.repeat(filledLength)}${'-'.repeat(barLength - filledLength)}`;
@@ -120,7 +140,11 @@ class CleanNonJSFilePlugin {
 }
 
 class ForceWriteBundlePlugin {
-  public constructor(private readonly outputPath: string) {}
+  public constructor(
+    private readonly outputPath: string,
+    private readonly obfuscate: boolean,
+    private readonly obfuscatorOptions?: ObfuscatorOptions,
+  ) {}
 
   public apply(compiler: webpack.Compiler) {
     compiler.hooks.compilation.tap(ForceWriteBundlePlugin.name, (compilation) => {
@@ -132,10 +156,26 @@ class ForceWriteBundlePlugin {
         (assets) => {
           Object.entries(assets).forEach(([pathname, asset]) => {
             const absolutePath = path.resolve(this.outputPath, pathname);
+            let fileContentBuffer = _.attempt(() => asset?.buffer?.() as NodeJS.ArrayBufferView);
+
+            if (fileContentBuffer instanceof Error || !Buffer.isBuffer(fileContentBuffer)) return;
+
             _.attempt(() => {
               fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
             });
-            fs.writeFileSync(absolutePath, asset?.buffer?.() as NodeJS.ArrayBufferView);
+
+            if (this.obfuscate) {
+              fileContentBuffer = _.attempt(
+                () =>
+                  Buffer.from(
+                    obfuscate(fileContentBuffer.toString(), this.obfuscatorOptions).getObfuscatedCode(),
+                  ) as NodeJS.ArrayBufferView,
+              );
+            }
+
+            if (fileContentBuffer instanceof Error) return;
+
+            fs.writeFileSync(absolutePath, fileContentBuffer);
           });
         },
       );
@@ -266,6 +306,8 @@ const FORGE_OPTIONS_SCHEMA = z.object({
   entry: z.union([z.string().default('main.ts'), z.undefined()]),
   logLevel: z.union([SchemaUtil.LOG_LEVEL.default('info'), z.literal(false), z.undefined()]),
   mode: z.union([z.enum(['development', 'production']).default('production'), z.undefined()]),
+  obfuscate: z.union([z.boolean().default(false), z.undefined()]),
+  obfuscatorConfigFile: z.union([z.string(), z.undefined()]),
   outputDir: z.union([z.string().default('dist'), z.undefined()]),
   outputName: z.union([z.string().default('main'), z.undefined()]),
   outputNameFormat: z.union([z.string().default('[name].js'), z.undefined()]),
@@ -275,7 +317,7 @@ const FORGE_OPTIONS_SCHEMA = z.object({
   workDir: z.union([z.string().default(process.cwd()), z.undefined()]),
 });
 
-type ForgeBaseOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
+type ForgeBaseOptions = Omit<z.infer<typeof FORGE_OPTIONS_SCHEMA>, 'obfuscatorConfigFile'>;
 type AfterEmitAction = z.infer<typeof AFTER_EMIT_ACTION_SCHEMA>;
 
 const FORKED_FORGE_OPTIONS_ENV_NAME = 'FORKED_FORGE_OPTIONS';
@@ -320,7 +362,10 @@ export class Forge {
   protected virtualEntryFilePath: string;
   protected definitions: Record<string, string> = {};
 
-  public constructor(private readonly inputOptions: ForgeOptions) {
+  public constructor(
+    private readonly inputOptions: ForgeOptions,
+    private readonly obfuscatorConfig: ObfuscatorOptions,
+  ) {
     this.options = FORGE_OPTIONS_SCHEMA.parse(this.inputOptions);
     const configPath = ts.findConfigFile(this.options.workDir!, ts.sys.fileExists, this.options.tsProject!);
 
@@ -542,7 +587,9 @@ export class Forge {
                 ) ||
                 this.options?.debug
               ) {
-                result.push(new ForceWriteBundlePlugin(this.outputPath));
+                result.push(
+                  new ForceWriteBundlePlugin(this.outputPath, this.options.obfuscate!, this.obfuscatorConfig),
+                );
                 if (this.options?.debug) return result;
               }
 
@@ -583,6 +630,7 @@ export class Forge {
 
             return sourceCode;
           };
+
           if (error) {
             this.handleLog(
               'error',
@@ -684,6 +732,15 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
         defaultValue: 'dist',
       },
       {
+        flags: '--obfuscate',
+        description: 'Whether to obfuscate the code',
+        defaultValue: false,
+      },
+      {
+        flags: '--obfuscator-config-file <string>',
+        description: 'Path to JavaScript obfuscator config file',
+      },
+      {
         flags: '--output-name <string>',
         description: 'Output file name',
         defaultValue: 'main',
@@ -733,11 +790,15 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
   });
 
   command.action((entry, commandOptions) => {
-    new Forge({
+    const baseOptions = {
       entry,
       ...options,
       ...commandOptions,
-    } as unknown as ForgeOptions).run();
+    } as unknown as z.infer<typeof FORGE_OPTIONS_SCHEMA>;
+    new Forge(
+      _.omit(baseOptions, ['obfuscatorConfigFile']),
+      loadObfuscatorConfig(baseOptions.obfuscatorConfigFile!),
+    ).run();
   });
 
   return command;
@@ -772,17 +833,20 @@ if (IS_FORKED && require.main === module) {
   watcher.on('unlink', handleChange);
 
   const options = FORKED_FORGE_OPTIONS_SCHEMA.parse(JSON.parse(process.env?.[FORKED_FORGE_OPTIONS_ENV_NAME] as string));
-  new Forge({
-    ..._.omit(options, ['entryFileContent']),
-    getEntryFileContent: () => options.entryFileContent,
-    onLog: (level, message) => {
-      process.send!({
-        type: 'log',
-        level,
-        message,
-      } as Message);
+  new Forge(
+    {
+      ..._.omit(options, ['entryFileContent', 'obfuscatorConfigFile']),
+      getEntryFileContent: () => options.entryFileContent,
+      onLog: (level, message) => {
+        process.send!({
+          type: 'log',
+          level,
+          message,
+        } as Message);
+      },
     },
-  })
+    loadObfuscatorConfig(options.obfuscatorConfigFile!),
+  )
     .run()
     .catch((error) => {
       process.send!({
