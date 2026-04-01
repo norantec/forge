@@ -30,12 +30,11 @@ function renderProgressBar(percent, message, file) {
   const barLength = 40;
   const filledLength = Math.round((percent / 100) * barLength);
   const bar = `${'='.repeat(filledLength)}${'-'.repeat(barLength - filledLength)}`;
-  const chalkInstance = new chalk.Chalk({ level: 3 });
 
   readline.clearLine(process.stdout, 0);
   readline.cursorTo(process.stdout, 0);
   process.stdout.write(
-    `${chalkInstance.green(`[${bar}]`)} ${chalkInstance.yellow(`${percent}%`)} ${chalkInstance.gray(message)} ${chalkInstance.cyan(file)}`,
+    `${chalk.green(`[${bar}]`)} ${chalk.yellow(`${percent}%`)} ${chalk.gray(message)} ${chalk.cyan(file)}`,
   );
 
   if (percent === 100) {
