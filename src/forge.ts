@@ -23,6 +23,7 @@ import { fork } from 'node:child_process';
 import { LogUtil } from '@open-norantec/utilities/dist/log-util.class';
 import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
 import * as requireFromString from 'require-from-string';
+import { merge } from 'webpack-merge';
 
 export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
 
@@ -44,6 +45,24 @@ function loadObfuscatorConfig(obfuscatorConfigFilePath: string): ObfuscatorOptio
   if (obfuscatorConfig instanceof Error) return {};
 
   return obfuscatorConfig;
+}
+
+function loadBuildConfig(buildConfigFilePath: string): webpack.Configuration {
+  if (StringUtil.isFalsyString(buildConfigFilePath)) return {};
+
+  const absoluteBuildConfigFilePath = path.resolve(buildConfigFilePath!);
+
+  if (!fs.existsSync(absoluteBuildConfigFilePath) || !fs.statSync(absoluteBuildConfigFilePath).isFile()) {
+    return {};
+  }
+
+  const buildConfig = _.attempt(() =>
+    _.pick(requireFromString(fs.readFileSync(absoluteBuildConfigFilePath).toString()), ['externals']),
+  );
+
+  if (buildConfig instanceof Error || !_.isObjectLike(buildConfig)) return {};
+
+  return buildConfig as webpack.Configuration;
 }
 
 function renderProgressBar(percent: number, message: string, file: string) {
@@ -299,6 +318,7 @@ const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none',
 
 const FORGE_OPTIONS_SCHEMA = z.object({
   afterEmitAction: z.union([AFTER_EMIT_ACTION_SCHEMA, z.undefined()]),
+  buildConfigFile: z.union([z.string(), z.undefined()]),
   clean: z.union([z.boolean().default(true), z.undefined()]),
   debug: z.union([z.boolean().default(false), z.undefined()]),
   define: z.union([z.array(z.string()).default([]), z.undefined()]),
@@ -317,7 +337,7 @@ const FORGE_OPTIONS_SCHEMA = z.object({
   workDir: z.union([z.string().default(process.cwd()), z.undefined()]),
 });
 
-type ForgeBaseOptions = Omit<z.infer<typeof FORGE_OPTIONS_SCHEMA>, 'obfuscatorConfigFile'>;
+type ForgeBaseOptions = Omit<z.infer<typeof FORGE_OPTIONS_SCHEMA>, 'obfuscatorConfigFile' | 'buildConfigFile'>;
 type AfterEmitAction = z.infer<typeof AFTER_EMIT_ACTION_SCHEMA>;
 
 const FORKED_FORGE_OPTIONS_ENV_NAME = 'FORKED_FORGE_OPTIONS';
@@ -365,6 +385,7 @@ export class Forge {
   public constructor(
     private readonly inputOptions: ForgeOptions,
     private readonly obfuscatorConfig: ObfuscatorOptions,
+    private readonly buildConfig: webpack.Configuration = {},
   ) {
     this.options = FORGE_OPTIONS_SCHEMA.parse(this.inputOptions);
     const configPath = ts.findConfigFile(this.options.workDir!, ts.sys.fileExists, this.options.tsProject!);
@@ -506,105 +527,110 @@ export class Forge {
         if (StringUtil.isFalsyString(this.options.outputName!)) reject(new Error(`Invalid generate type`));
 
         const volume = new memfs.Volume() as memfs.IFs;
-        const compiler = webpack({
-          cache: false,
-          bail: true,
-          optimization: {
-            minimize: false,
-            minimizer: [
-              new TerserPlugin({
-                terserOptions: {
-                  keep_classnames: true,
-                  keep_fnames: true,
-                },
-              }),
-            ],
-          },
-          entry: {
-            [`${this.options.outputName!}${this.options.afterEmitAction! === 'compile' ? `-${process.arch}` : ''}`]:
-              this.virtualEntryFilePath,
-          },
-          target: 'node',
-          mode: this.options.mode!,
-          output: {
-            devtoolModuleFilenameTemplate: '[absolute-resource-path]',
-            filename: this.options.outputNameFormat,
-            path: this.outputPath,
-            libraryTarget: 'commonjs',
-          },
-          resolve: {
-            extensions: ['.js', '.cjs', '.mjs', '.ts', '.tsx'],
-            alias: {
-              src: path.resolve(this.options.workDir!, this.options.sourceDir!),
-              UNKNOWN: false,
-            },
-            plugins: [
-              new CatchNotFoundPlugin((level, message) => {
-                this.handleLog(level, message);
-              }),
-            ],
-          },
-          module: {
-            rules: [
-              {
-                test: /\.ts$/,
-                use: {
-                  loader: require.resolve('ts-loader'),
-                  options: {
-                    ...(StringUtil.isFalsyString(this.options?.tsCompiler)
-                      ? {}
-                      : { compiler: this.options.tsCompiler! }),
-                    configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
-                  },
-                },
-                exclude: /node_modules/,
+        const compiler = webpack(
+          merge(
+            {
+              cache: false,
+              bail: true,
+              optimization: {
+                minimize: false,
+                minimizer: [
+                  new TerserPlugin({
+                    terserOptions: {
+                      keep_classnames: true,
+                      keep_fnames: true,
+                    },
+                  }),
+                ],
               },
-            ],
-          },
-          plugins: [
-            new VirtualFilePlugin(volume),
-            new webpack.DefinePlugin(this.definitions),
-            new webpack.ProgressPlugin((percentage, message, ...args) => {
-              if (typeof this.inputOptions?.onProgress === 'function') {
-                this.inputOptions.onProgress(percentage, message, ...args);
-              } else {
-                renderProgressBar(Math.floor(percentage * 100), message, args[0] || '');
-              }
-            }),
-            ...(() => {
-              const result: any[] = [];
-
-              result.push(
-                new CleanNonJSFilePlugin(),
-                new VirtualModulesPlugin({
-                  [this.virtualEntryFilePath]: entryFileContent,
-                }),
-              );
-
-              if (
-                !(['run-once', 'watch', 'disable-writing'] as AfterEmitAction[]).includes(
-                  this.options.afterEmitAction!,
-                ) ||
-                this.options?.debug
-              ) {
-                result.push(
-                  new ForceWriteBundlePlugin(this.outputPath, this.options.obfuscate!, this.obfuscatorConfig),
-                );
-                if (this.options?.debug) return result;
-              }
-
-              if (this.options.afterEmitAction! === 'compile') {
-                result.push(
-                  new CompilePlugin(this.outputPath, volume, (level, message) => {
+              entry: {
+                [`${this.options.outputName!}${this.options.afterEmitAction! === 'compile' ? `-${process.arch}` : ''}`]:
+                  this.virtualEntryFilePath,
+              },
+              target: 'node',
+              mode: this.options.mode!,
+              output: {
+                devtoolModuleFilenameTemplate: '[absolute-resource-path]',
+                filename: this.options.outputNameFormat,
+                path: this.outputPath,
+                libraryTarget: 'commonjs',
+              },
+              resolve: {
+                extensions: ['.js', '.cjs', '.mjs', '.ts', '.tsx'],
+                alias: {
+                  src: path.resolve(this.options.workDir!, this.options.sourceDir!),
+                  UNKNOWN: false,
+                },
+                plugins: [
+                  new CatchNotFoundPlugin((level, message) => {
                     this.handleLog(level, message);
                   }),
-                );
-              }
+                ],
+              },
+              module: {
+                rules: [
+                  {
+                    test: /\.ts$/,
+                    use: {
+                      loader: require.resolve('ts-loader'),
+                      options: {
+                        ...(StringUtil.isFalsyString(this.options?.tsCompiler)
+                          ? {}
+                          : { compiler: this.options.tsCompiler! }),
+                        configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
+                      },
+                    },
+                    exclude: /node_modules/,
+                  },
+                ],
+              },
+              plugins: [
+                new VirtualFilePlugin(volume),
+                new webpack.DefinePlugin(this.definitions),
+                new webpack.ProgressPlugin((percentage, message, ...args) => {
+                  if (typeof this.inputOptions?.onProgress === 'function') {
+                    this.inputOptions.onProgress(percentage, message, ...args);
+                  } else {
+                    renderProgressBar(Math.floor(percentage * 100), message, args[0] || '');
+                  }
+                }),
+                ...(() => {
+                  const result: any[] = [];
 
-              return result;
-            })(),
-          ],
-        });
+                  result.push(
+                    new CleanNonJSFilePlugin(),
+                    new VirtualModulesPlugin({
+                      [this.virtualEntryFilePath]: entryFileContent,
+                    }),
+                  );
+
+                  if (
+                    !(['run-once', 'watch', 'disable-writing'] as AfterEmitAction[]).includes(
+                      this.options.afterEmitAction!,
+                    ) ||
+                    this.options?.debug
+                  ) {
+                    result.push(
+                      new ForceWriteBundlePlugin(this.outputPath, this.options.obfuscate!, this.obfuscatorConfig),
+                    );
+                    if (this.options?.debug) return result;
+                  }
+
+                  if (this.options.afterEmitAction! === 'compile') {
+                    result.push(
+                      new CompilePlugin(this.outputPath, volume, (level, message) => {
+                        this.handleLog(level, message);
+                      }),
+                    );
+                  }
+
+                  return result;
+                })(),
+              ],
+            },
+            this.buildConfig,
+          ),
+        );
 
         compiler.run((error, result) => {
           const getSourceCode = () => {
@@ -708,6 +734,10 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
         defaultValue: 'none',
       },
       {
+        flags: '--build-config-file <string>',
+        description: 'Path to build config file for Webpack',
+      },
+      {
         flags: '--clean',
         description: 'Clean legacy output',
         defaultValue: true,
@@ -798,6 +828,7 @@ export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
     new Forge(
       _.omit(baseOptions, ['obfuscatorConfigFile']),
       loadObfuscatorConfig(baseOptions.obfuscatorConfigFile!),
+      loadBuildConfig(baseOptions.buildConfigFile!),
     ).run();
   });
 
@@ -846,6 +877,7 @@ if (IS_FORKED && require.main === module) {
       },
     },
     loadObfuscatorConfig(options.obfuscatorConfigFile!),
+    loadBuildConfig(options.buildConfigFile!),
   )
     .run()
     .catch((error) => {
