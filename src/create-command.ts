@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { z } from 'zod';
 import * as _ from 'lodash';
-import { Forge, ForgeOptions, RunOptions } from './ng';
+import { Forge, ForgeOptions } from './ng';
 import * as fs from 'fs-extra';
 import * as path from 'node:path';
 
@@ -24,7 +24,6 @@ const CREATE_COMMAND_OPTIONS = z.object({
 export const createCommand = (
   rawOptions: z.infer<typeof CREATE_COMMAND_OPTIONS> & {
     defaultOptions?: Partial<ForgeOptions>;
-    defaultRunOptions?: Partial<RunOptions>;
     onLog?: (level: string, message: string) => void;
   },
 ) => {
@@ -100,8 +99,17 @@ export const createCommand = (
 
   command.action(async (source: string, output: string, options: Record<string, any> = {}) => {
     // TODO: definitions
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars
-    const { executeAfterBuild, tsProject, define, definitions, disableWriteFile = false, ...runOptions } = options;
+    const {
+      executeAfterBuild,
+      tsProject,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      define,
+      // eslint-disable-next-line @typescript-eslint/no-unused-vars
+      definitions: definitionsFile,
+      disableWriteFile = false,
+      ...otherOptions
+    } = options;
+    const definitions = {};
     const forge = new Forge({
       onLog: log,
       onOutputFile: (filePath, content) => {
@@ -123,16 +131,21 @@ export const createCommand = (
         }
         return content;
       },
+      getWatcher: (callback) => {
+        const watcher = fs.watch(process.cwd(), { recursive: true }, (eventType, filename) => {
+          callback(path.resolve(filename));
+        });
+        return { close: watcher.close.bind(watcher) };
+      },
       ...rawOptions?.defaultOptions,
+      ...otherOptions,
+      definitions,
       entry: source,
       outputFile: output,
       tsProject,
       executeAfterBuild,
     });
-    await forge.run({
-      ...rawOptions?.defaultRunOptions,
-      ...(runOptions as unknown as RunOptions),
-    });
+    await forge.run();
   });
 
   return command;

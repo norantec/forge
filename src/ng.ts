@@ -12,22 +12,32 @@ import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
 import * as requireFromString from 'require-from-string';
 import { StringUtil } from '@open-norantec/utilities/dist/string-util.class';
 import { Worker } from 'node:worker_threads';
-import { EventEmitter } from 'eventemitter3';
+import * as crypto from 'node:crypto';
 
 const FORGE_OPTIONS_SCHEMA = z.object({
+  bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]),
+  definitions: z.record(z.string()).optional().default({}),
   entry: z.string().nonempty(),
   executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
+  obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
+  obfuscatorConfigFilePath: z.string().optional(),
   outputFile: z.string().nonempty(),
   tsProject: z.union([z.string().nonempty().default('tsconfig.json'), z.undefined()]),
+  watch: z.union([z.boolean().optional().default(false), z.undefined()]),
 });
 
 export type ForgeSerializableOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
+
+export type Watcher = {
+  close: () => void | Promise<void>;
+};
 
 export interface ForgeUnserializableOptions {
   typescript?: {
     customTransformers?: ts.CustomTransformers;
   };
   getVirtualEntryFileContent?: (buildEntryFilePath: string) => string;
+  getWatcher?: (callback: (filePath: string) => void | Promise<void>) => Watcher;
   onGetFileContent: (filePath: string) => string;
   onOutputFile: (filePath: string, content: string) => void;
   onLog?: (level: Schema.LogLevel, message?: string) => void;
@@ -36,28 +46,35 @@ export interface ForgeUnserializableOptions {
 
 export type ForgeOptions = ForgeSerializableOptions & ForgeUnserializableOptions;
 
-const RUN_OPTIONS_SCHEMA = z.object({
-  bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]),
-  definitions: z.record(z.string()).optional().default({}),
-  obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
-  obfuscatorConfigFilePath: z.string().optional(),
-  watch: z.union([z.boolean().optional().default(false), z.undefined()]),
-});
-
-export type RunOptions = z.infer<typeof RUN_OPTIONS_SCHEMA>;
-
 function maybeESModule(code: string) {
   const [imports, exports] = parseESModuleLex(code);
   return imports.length > 0 || exports.length > 0;
 }
 
 export class Forge {
-  protected readonly emitter = new EventEmitter();
-  protected readonly workers = new Set<Worker>();
+  protected readonly WORKERS = new Set<Worker>();
+  protected readonly CONCERNED_FILES = new Map<string, string>();
 
   protected readonly options: ForgeSerializableOptions = ((originalOptions: ForgeOptions) => {
     return FORGE_OPTIONS_SCHEMA.parse(originalOptions);
   })(this.originalOptions);
+
+  protected readonly watcher =
+    typeof this.originalOptions.getWatcher !== 'function' || !this.options?.watch
+      ? { close: () => {} }
+      : ((originalOptions: ForgeOptions, CONCERNED_FILES: typeof this.CONCERNED_FILES, run: typeof this.run) => {
+          const rerun = _.debounce(run.bind(this), 500);
+          return originalOptions.getWatcher!(async (filePath) => {
+            if (
+              !CONCERNED_FILES.has(filePath) ||
+              crypto.createHash('sha256').update(originalOptions.onGetFileContent(filePath)).digest('hex') ===
+                CONCERNED_FILES.get(filePath)
+            ) {
+              return;
+            }
+            await rerun();
+          });
+        })(this.originalOptions, this.CONCERNED_FILES, this.run.bind(this));
 
   protected readonly configPath = ((tsProject: string) => ts.findConfigFile('.', ts.sys.fileExists, tsProject!)!)(
     this.options.tsProject!,
@@ -65,17 +82,10 @@ export class Forge {
 
   public constructor(protected readonly originalOptions: ForgeOptions) {}
 
-  public async run(options?: RunOptions) {
+  public async run() {
     await init;
 
     const outputMap = new Map<string, string>();
-    const runOptions = _.attempt(() => RUN_OPTIONS_SCHEMA.parse(options || {}));
-
-    if (runOptions instanceof Error) {
-      this.log('error', `Invalid build options: ${runOptions.message}`);
-      return;
-    }
-
     const tsConfig = ((configPath: string) => {
       return ts.parseJsonConfigFileContent(
         ts.readConfigFile(configPath, ts.sys.readFile).config,
@@ -83,6 +93,18 @@ export class Forge {
         path.dirname(configPath),
       );
     })(this.configPath);
+
+    if (!!this.options.watch) {
+      Array.from(this.CONCERNED_FILES.keys()).forEach((filePath) => this.CONCERNED_FILES.delete(filePath));
+      tsConfig.fileNames.forEach((fileName) => {
+        const filePath = path.resolve(fileName);
+        this.CONCERNED_FILES.set(
+          filePath,
+          crypto.createHash('sha256').update(this.originalOptions.onGetFileContent(filePath)).digest('hex'),
+        );
+      });
+    }
+
     tsConfig.options.configFilePath = this.configPath;
     const buildEntryFilePath = ((parsedCommandLine: ts.ParsedCommandLine) => {
       const result = _.attempt(() =>
@@ -121,9 +143,9 @@ export class Forge {
     this.log('info', `Using entry file: ${finalBuildEntryFilePath}`);
 
     const loadObfuscatorConfig = (): ObfuscatorOptions => {
-      if (StringUtil.isFalsyString(runOptions.obfuscatorConfigFilePath)) return {};
+      if (StringUtil.isFalsyString(this.options.obfuscatorConfigFilePath)) return {};
 
-      const absoluteObfuscatorConfigFilePath = path.resolve(runOptions.obfuscatorConfigFilePath!);
+      const absoluteObfuscatorConfigFilePath = path.resolve(this.options.obfuscatorConfigFilePath!);
       const obfuscatorConfig = _.attempt(() =>
         requireFromString(this.originalOptions.onGetFileContent(absoluteObfuscatorConfigFilePath)),
       );
@@ -144,7 +166,7 @@ export class Forge {
         logLevel: 'silent',
         format: 'cjs',
         write: false,
-        define: runOptions.definitions,
+        define: this.options.definitions,
         plugins: [
           {
             name: 'tsconfig-paths',
@@ -197,7 +219,7 @@ export class Forge {
                   return;
                 }
 
-                if (runOptions.obfuscate) {
+                if (this.options.obfuscate) {
                   resultCode = (() => {
                     const obfuscatedCode = _.attempt(() => {
                       return obfuscate(resultCode!, loadObfuscatorConfig()).getObfuscatedCode();
@@ -211,7 +233,7 @@ export class Forge {
                   resultCode = this.originalOptions.rewriteOutputFile!(resultCode!);
                 }
 
-                this.handleOutputFile(absoluteOutputFile, resultCode!, !!runOptions.watch);
+                this.handleOutputFile(absoluteOutputFile, resultCode!, !!this.options.watch);
               });
 
               build.onResolve({ filter: /.*/ }, async (args) => {
@@ -250,7 +272,7 @@ export class Forge {
                   }
                 }
 
-                if (runOptions.bundleDependencies) {
+                if (this.options.bundleDependencies) {
                   const requiredPath = _.attempt(() =>
                     require.resolve(args.path, {
                       paths: [
@@ -380,7 +402,7 @@ export class Forge {
 
     if (!watchMode || !this.options.executeAfterBuild) return;
 
-    Array.from(this.workers).forEach((worker) => {
+    Array.from(this.WORKERS).forEach((worker) => {
       _.attempt(() => worker.terminate());
     });
 
@@ -388,7 +410,7 @@ export class Forge {
 
     const worker = new Worker(content!, { eval: true });
 
-    this.workers.add(worker);
+    this.WORKERS.add(worker);
 
     worker.on('error', (error) => {
       this.log('error', `Bundle execution error: ${error.message}`);
@@ -396,8 +418,8 @@ export class Forge {
     });
 
     worker.on('exit', (code) => {
-      this.log('info', `Bundle execution exited with code ${code}`);
-      this.workers.delete(worker);
+      this.log('info', `Current bundle execution exited (${code}), waiting for next execution...`);
+      this.WORKERS.delete(worker);
     });
   }
 }
