@@ -1,6 +1,6 @@
 {
   "name": "@open-norantec/forge",
-  "version": "1.0.1",
+  "version": "2.0.0",
   "description": "Forge is a builder for all TypeScript projects",
   "main": "dist/index.js",
   "scripts": {
