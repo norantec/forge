@@ -21,6 +21,7 @@ const FORGE_OPTIONS_SCHEMA = z.object({
   definitionsFile: z.string().nonempty().optional(),
   entry: z.string().nonempty(),
   executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
+  externals: z.array(z.string().nonempty()).optional(),
   obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
   obfuscatorConfigFilePath: z.string().optional(),
   outputFile: z.string().nonempty(),
@@ -170,6 +171,7 @@ export class Forge {
           '.node': 'base64',
         },
         logLevel: 'silent',
+        external: this.options.externals,
         format: 'cjs',
         write: false,
         define: (() => {

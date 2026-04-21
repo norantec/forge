@@ -85,7 +85,13 @@ export const createCommand = (
       },
       {
         flags: '--define <string>',
-        description: 'Define a single definition, e.g. --define FOO=1, BAR=\"2\". Prior to --definitions',
+        description: 'Define a single definition, e.g. --define FOO=1 --define BAR=\"2\". Prior to --definitions',
+        parser: collect,
+      },
+      {
+        flags: '--external <string>',
+        description:
+          'Define a single definition, e.g. --external "*.png" --external "/images/*". Prior to --definitions',
         parser: collect,
       },
     ] as CommandOption[]
@@ -110,6 +116,7 @@ export const createCommand = (
       define,
       definitionsFile,
       disableWriteFile = false,
+      external,
       ...otherOptions
     } = options;
 
@@ -146,6 +153,7 @@ export const createCommand = (
       })(),
       ...otherOptions,
       definitionsFile,
+      externals: external,
       define,
       cwd: process.cwd(),
       entry: source,
