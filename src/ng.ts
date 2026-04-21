@@ -11,9 +11,12 @@ import * as babel from '@babel/core';
 import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
 import * as requireFromString from 'require-from-string';
 import { StringUtil } from '@open-norantec/utilities/dist/string-util.class';
+import { Worker } from 'node:worker_threads';
+import { EventEmitter } from 'eventemitter3';
 
 const FORGE_OPTIONS_SCHEMA = z.object({
   entry: z.string().nonempty(),
+  executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
   outputFile: z.string().nonempty(),
   tsProject: z.union([z.string().nonempty().default('tsconfig.json'), z.undefined()]),
 });
@@ -21,51 +24,58 @@ const FORGE_OPTIONS_SCHEMA = z.object({
 export type ForgeSerializableOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
 
 export interface ForgeUnserializableOptions {
-  typescript: {
+  typescript?: {
     customTransformers?: ts.CustomTransformers;
   };
+  getVirtualEntryFileContent?: (buildEntryFilePath: string) => string;
   onGetFileContent: (filePath: string) => string;
   onOutputFile: (filePath: string, content: string) => void;
   onLog?: (level: Schema.LogLevel, message?: string) => void;
+  rewriteOutputFile?: (code: string) => string;
 }
 
 export type ForgeOptions = ForgeSerializableOptions & ForgeUnserializableOptions;
 
-const BUILD_OPTIONS_SCHEMA = z.object({
+const RUN_OPTIONS_SCHEMA = z.object({
   bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]),
-  defines: z.record(z.string()).optional().default({}),
+  definitions: z.record(z.string()).optional().default({}),
   obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
   obfuscatorConfigFilePath: z.string().optional(),
+  watch: z.union([z.boolean().optional().default(false), z.undefined()]),
 });
 
-export type BuildOptions = z.infer<typeof BUILD_OPTIONS_SCHEMA>;
+export type RunOptions = z.infer<typeof RUN_OPTIONS_SCHEMA>;
 
 function maybeESModule(code: string) {
   const [imports, exports] = parseESModuleLex(code);
   return imports.length > 0 || exports.length > 0;
 }
 
+const RUNNER_EXIT = Symbol();
+
 export class Forge {
+  protected readonly emitter = new EventEmitter();
   protected readonly outputMap = new Map<string, string>();
 
-  protected readonly options: ForgeSerializableOptions = FORGE_OPTIONS_SCHEMA.parse(this.originalOptions);
+  protected readonly options: ForgeSerializableOptions = ((originalOptions: ForgeOptions) => {
+    return FORGE_OPTIONS_SCHEMA.parse(originalOptions);
+  })(this.originalOptions);
 
-  protected readonly configPath = ts.findConfigFile('.', ts.sys.fileExists, this.options.tsProject!)!;
-
-  protected readonly tsConfig = ts.parseJsonConfigFileContent(
-    ts.readConfigFile(this.configPath, ts.sys.readFile),
-    ts.sys,
-    path.dirname(this.configPath),
+  protected readonly configPath = ((tsProject: string) => ts.findConfigFile('.', ts.sys.fileExists, tsProject!)!)(
+    this.options.tsProject!,
   );
 
-  protected readonly entryOutputPath = _.attempt(() =>
-    ts
-      .getOutputFileNames(this.tsConfig, path.relative(process.cwd(), path.resolve(this.options.entry)), false)
-      .find((filePath) => filePath.endsWith('.js')),
-  );
+  protected readonly tsConfig = ((configPath: string) => {
+    return ts.parseJsonConfigFileContent(
+      ts.readConfigFile(configPath, ts.sys.readFile).config,
+      ts.sys,
+      path.dirname(configPath),
+    );
+  })(this.configPath);
 
-  public constructor(protected readonly originalOptions: ForgeOptions) {
-    const tsProgram = ts.createProgram({ rootNames: this.tsConfig.fileNames, options: this.tsConfig.options });
+  protected readonly buildEntryFilePath = ((parsedCommandLine: ts.ParsedCommandLine, configPath: string) => {
+    this.tsConfig.options.configFilePath = configPath;
+    const tsProgram = ts.createProgram({ rootNames: parsedCommandLine.fileNames, options: parsedCommandLine.options });
     tsProgram.emit(
       undefined,
       (fileName, data) => {
@@ -77,24 +87,46 @@ export class Forge {
       false,
       this.originalOptions?.typescript?.customTransformers,
     );
-  }
+    const result = _.attempt(() =>
+      ts
+        .getOutputFileNames(parsedCommandLine, path.relative(process.cwd(), path.resolve(this.options.entry)), false)
+        .find((filePath) => filePath.endsWith('.js')),
+    );
+    if (result instanceof Error) return undefined;
+    return result;
+  })(this.tsConfig, this.configPath);
 
-  public async build(options?: BuildOptions) {
+  protected readonly virtualEntryFileContent = ((entryFilePath) => {
+    if (StringUtil.isFalsyString(entryFilePath)) return undefined;
+    if (typeof this.originalOptions.getVirtualEntryFileContent !== 'function') return undefined;
+    return this.originalOptions.getVirtualEntryFileContent!(entryFilePath!);
+  })(path.resolve(this.buildEntryFilePath!));
+
+  protected readonly finalBuildEntryFilePath =
+    typeof this.buildEntryFilePath === 'undefined'
+      ? null
+      : StringUtil.isFalsyString(this.virtualEntryFileContent)
+        ? this.buildEntryFilePath
+        : path.resolve(
+            path.dirname(this.buildEntryFilePath),
+            `entry-${Date.now()}-${Math.random().toString(16).slice(2)}.js`,
+          );
+
+  protected readonly virtualEntryMode = this.buildEntryFilePath !== this.finalBuildEntryFilePath;
+
+  public constructor(protected readonly originalOptions: ForgeOptions) {}
+
+  public async run(options?: RunOptions) {
     await init;
 
-    const buildOptions = _.attempt(() => BUILD_OPTIONS_SCHEMA.parse(options || {}));
+    const runOptions = _.attempt(() => RUN_OPTIONS_SCHEMA.parse(options || {}));
 
-    if (buildOptions instanceof Error) {
-      this.log('error', `Invalid build options: ${buildOptions.message}`);
+    if (runOptions instanceof Error) {
+      this.log('error', `Invalid build options: ${runOptions.message}`);
       return;
     }
 
-    if (this.entryOutputPath instanceof Error) {
-      this.log('error', `Failed to determine entry output path: ${this.entryOutputPath.message}`);
-      return;
-    }
-
-    if (typeof this.entryOutputPath === 'undefined') {
+    if (this.finalBuildEntryFilePath === null) {
       this.log(
         'error',
         `Failed to determine entry output path: No .js output file found for entry ${this.options.entry}`,
@@ -102,10 +134,12 @@ export class Forge {
       return;
     }
 
-    const loadObfuscatorConfig = (): ObfuscatorOptions => {
-      if (StringUtil.isFalsyString(buildOptions.obfuscatorConfigFilePath)) return {};
+    this.log('info', `Using entry file: ${this.finalBuildEntryFilePath}`);
 
-      const absoluteObfuscatorConfigFilePath = path.resolve(buildOptions.obfuscatorConfigFilePath!);
+    const loadObfuscatorConfig = (): ObfuscatorOptions => {
+      if (StringUtil.isFalsyString(runOptions.obfuscatorConfigFilePath)) return {};
+
+      const absoluteObfuscatorConfigFilePath = path.resolve(runOptions.obfuscatorConfigFilePath!);
       const obfuscatorConfig = _.attempt(() =>
         requireFromString(this.originalOptions.onGetFileContent(absoluteObfuscatorConfigFilePath)),
       );
@@ -115,9 +149,9 @@ export class Forge {
       return obfuscatorConfig;
     };
 
-    const esbuildResult = await AttemptUtil.execPromise(
-      esbuild.build({
-        entryPoints: [path.resolve(this.entryOutputPath!)],
+    const esbuildContext = await AttemptUtil.execPromise(
+      esbuild.context({
+        entryPoints: [path.resolve(this.finalBuildEntryFilePath)],
         bundle: true,
         platform: 'node',
         loader: {
@@ -126,8 +160,44 @@ export class Forge {
         logLevel: 'silent',
         format: 'cjs',
         write: false,
-        define: buildOptions.defines,
+        define: runOptions.definitions,
         plugins: [
+          {
+            name: 'watch-result',
+            setup: (build) => {
+              build.onEnd((result) => {
+                if (result.errors.length > 0) {
+                  this.log('error', `Build failed with ${result.errors.length} errors`);
+                  result.errors.forEach((error) => this.log('error', error.text));
+                  return;
+                }
+
+                const absoluteOutputFile = path.resolve(this.options.outputFile);
+                let resultCode = result.outputFiles?.[0]?.text;
+
+                if (StringUtil.isFalsyString(resultCode)) {
+                  this.log('error', 'No output code generated');
+                  return;
+                }
+
+                if (runOptions.obfuscate) {
+                  resultCode = (() => {
+                    const obfuscatedCode = _.attempt(() => {
+                      return obfuscate(resultCode!, loadObfuscatorConfig()).getObfuscatedCode();
+                    });
+                    if (obfuscatedCode instanceof Error) return resultCode;
+                    return obfuscatedCode;
+                  })();
+                }
+
+                if (typeof this.originalOptions.rewriteOutputFile === 'function') {
+                  resultCode = this.originalOptions.rewriteOutputFile!(resultCode!);
+                }
+
+                this.handleOutputFile(absoluteOutputFile, resultCode!, !!runOptions.watch);
+              });
+            },
+          },
           {
             name: 'tsconfig-paths',
             setup: (build) => {
@@ -165,6 +235,10 @@ export class Forge {
             name: 'forge',
             setup: (build) => {
               build.onResolve({ filter: /.*/ }, async (args) => {
+                if (this.virtualEntryMode && StringUtil.isFalsyString(args.importer)) {
+                  return { path: args.path, namespace: 'virtual-entry' };
+                }
+
                 if (
                   args.path.startsWith('node:') ||
                   module.builtinModules.some(
@@ -196,7 +270,7 @@ export class Forge {
                   }
                 }
 
-                if (buildOptions.bundleDependencies) {
+                if (runOptions.bundleDependencies) {
                   const requiredPath = _.attempt(() =>
                     require.resolve(args.path, {
                       paths: [
@@ -224,6 +298,13 @@ export class Forge {
                 }
 
                 return { path: args.path, external: true };
+              });
+
+              build.onLoad({ filter: /.*/, namespace: 'virtual-entry' }, () => {
+                return {
+                  contents: this.virtualEntryFileContent!,
+                  loader: 'js',
+                };
               });
 
               build.onLoad({ filter: /.*/, namespace: 'vfs' }, (args) => {
@@ -288,35 +369,43 @@ export class Forge {
       }),
     );
 
-    if (esbuildResult instanceof Error) {
-      this.log('error', `Failed to build client code: ${esbuildResult.message}`);
+    if (esbuildContext instanceof Error) {
+      this.log('error', `Failed to create build context: ${esbuildContext.message}`);
       return;
     }
 
-    if (esbuildResult.errors.length > 0) {
-      this.log('error', `Builder built with error: ${esbuildResult.errors[0].text}`);
-      return;
+    if (runOptions.watch) {
+      await esbuildContext.watch();
+      this.emitter.on(RUNNER_EXIT, async () => {
+        await esbuildContext.rebuild();
+      });
+    } else {
+      await esbuildContext.rebuild();
+      await esbuildContext.dispose();
     }
-
-    const absoluteOutputFile = path.resolve(this.options.outputFile);
-    let resultCode = esbuildResult.outputFiles[0].text;
-
-    if (buildOptions.obfuscate) {
-      resultCode = (() => {
-        const obfuscatedCode = _.attempt(() => {
-          return obfuscate(resultCode, loadObfuscatorConfig()).getObfuscatedCode();
-        });
-
-        if (obfuscatedCode instanceof Error) return resultCode;
-
-        return obfuscatedCode;
-      })();
-    }
-
-    _.attempt(() => this.originalOptions.onOutputFile(absoluteOutputFile, resultCode));
   }
 
   protected log(level: Schema.LogLevel, ...messages: string[]) {
     _.attempt(() => this.originalOptions?.onLog?.(level, messages?.join?.(' ')));
+  }
+
+  protected handleOutputFile(filePath: string, content: string, watchMode = false) {
+    _.attempt(() => this.originalOptions.onOutputFile(filePath, content));
+
+    if (!watchMode || !this.options.executeAfterBuild) return;
+
+    this.log('info', `Executing output file ${filePath}`);
+
+    const worker = new Worker(content!, { eval: true });
+
+    worker.on('error', (error) => {
+      this.log('error', `Bundle execution error: ${error.message}`);
+      _.attempt(() => worker.terminate());
+    });
+
+    worker.on('exit', (code) => {
+      this.log('info', `Bundle execution exited with code ${code}`);
+      this.emitter.emit(RUNNER_EXIT);
+    });
   }
 }

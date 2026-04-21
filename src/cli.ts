@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 
-// import { createForgeCommand } from './forge';
+import { createCommand } from './create-command';
 
-// createForgeCommand({
-//   onLog: (level, message) => {
-//     console.log(`[${new Date().toISOString()}] [${level}] ${message}`);
-//   },
-// }).parse(process.argv);
+createCommand({
+  name: 'forge',
+  onLog: (level, message) => console.log(`[${new Date().toISOString()}]`, `- ${level} -`, message),
+})?.parse?.(process.argv);
