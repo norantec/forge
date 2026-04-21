@@ -4,7 +4,7 @@ import * as _ from 'lodash';
 import { Forge, ForgeOptions } from './ng';
 import * as fs from 'fs-extra';
 import * as path from 'node:path';
-import { Schema } from '@open-norantec/utilities';
+import { Schema, StringUtil } from '@open-norantec/utilities';
 
 interface CommandOption {
   flags: string;
@@ -24,7 +24,11 @@ const CREATE_COMMAND_OPTIONS = z.object({
 
 export const createCommand = (
   rawOptions: z.infer<typeof CREATE_COMMAND_OPTIONS> & {
-    defaultOptions?: Partial<ForgeOptions>;
+    defaultOptions?: (
+      source: string,
+      output: string | undefined,
+      options: Record<string, any>,
+    ) => Partial<ForgeOptions>;
     onLog?: (level: Schema.LogLevel, message: string) => void;
   },
 ) => {
@@ -73,6 +77,7 @@ export const createCommand = (
       {
         flags: '--watch',
         description: 'Enable watch mode to automatically rebuild on source file changes',
+        defaultValue: false,
       },
       {
         flags: '--execute-after-build',
@@ -96,9 +101,9 @@ export const createCommand = (
 
   command
     .argument('<source>', 'The source code file to be processed')
-    .argument('<output>', 'The output file for the generated code');
+    .argument('[output]', 'The output file for the generated code');
 
-  command.action(async (source: string, output: string, options: Record<string, any> = {}) => {
+  command.action(async (source: string, output: string | undefined, options: Record<string, any> = {}) => {
     const {
       executeAfterBuild,
       tsProject,
@@ -135,13 +140,16 @@ export const createCommand = (
         });
         return { close: watcher.close.bind(watcher) };
       },
-      ...rawOptions?.defaultOptions,
+      ...(() => {
+        const defaultOptions = rawOptions?.defaultOptions?.(source, output, options);
+        return defaultOptions instanceof Error ? {} : defaultOptions || {};
+      })(),
       ...otherOptions,
       definitionsFile,
       define,
       cwd: process.cwd(),
       entry: source,
-      outputFile: output,
+      outputFile: StringUtil.isFalsyString(output) ? './bundle.js' : output!,
       tsProject,
       executeAfterBuild,
     });
