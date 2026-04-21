@@ -117,6 +117,7 @@ export const createCommand = (
       definitionsFile,
       disableWriteFile = false,
       external,
+      obfuscatorConfigFile,
       ...otherOptions
     } = options;
 
@@ -156,6 +157,7 @@ export const createCommand = (
       externals: external,
       define,
       cwd: process.cwd(),
+      obfuscatorConfigFilePath: obfuscatorConfigFile,
       entry: source,
       outputFile: StringUtil.isFalsyString(output) ? './bundle.js' : output!,
       tsProject,
