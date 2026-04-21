@@ -24,6 +24,7 @@ const CREATE_COMMAND_OPTIONS = z.object({
 export const createCommand = (
   rawOptions: z.infer<typeof CREATE_COMMAND_OPTIONS> & {
     defaultOptions?: Partial<ForgeOptions>;
+    defaultRunOptions?: Partial<RunOptions>;
     onLog?: (level: string, message: string) => void;
   },
 ) => {
@@ -102,11 +103,6 @@ export const createCommand = (
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { executeAfterBuild, tsProject, define, definitions, disableWriteFile = false, ...runOptions } = options;
     const forge = new Forge({
-      ...rawOptions?.defaultOptions,
-      entry: source,
-      outputFile: output,
-      tsProject,
-      executeAfterBuild,
       onLog: log,
       onOutputFile: (filePath, content) => {
         if (!disableWriteFile) {
@@ -127,8 +123,16 @@ export const createCommand = (
         }
         return content;
       },
+      ...rawOptions?.defaultOptions,
+      entry: source,
+      outputFile: output,
+      tsProject,
+      executeAfterBuild,
     });
-    await forge.run(runOptions as unknown as RunOptions);
+    await forge.run({
+      ...rawOptions?.defaultRunOptions,
+      ...(runOptions as unknown as RunOptions),
+    });
   });
 
   return command;

@@ -51,11 +51,9 @@ function maybeESModule(code: string) {
   return imports.length > 0 || exports.length > 0;
 }
 
-const RUNNER_EXIT = Symbol();
-
 export class Forge {
   protected readonly emitter = new EventEmitter();
-  protected readonly outputMap = new Map<string, string>();
+  protected readonly workers = new Set<Worker>();
 
   protected readonly options: ForgeSerializableOptions = ((originalOptions: ForgeOptions) => {
     return FORGE_OPTIONS_SCHEMA.parse(originalOptions);
@@ -65,60 +63,12 @@ export class Forge {
     this.options.tsProject!,
   );
 
-  protected readonly tsConfig = ((configPath: string) => {
-    return ts.parseJsonConfigFileContent(
-      ts.readConfigFile(configPath, ts.sys.readFile).config,
-      ts.sys,
-      path.dirname(configPath),
-    );
-  })(this.configPath);
-
-  protected readonly buildEntryFilePath = ((parsedCommandLine: ts.ParsedCommandLine, configPath: string) => {
-    this.tsConfig.options.configFilePath = configPath;
-    const tsProgram = ts.createProgram({ rootNames: parsedCommandLine.fileNames, options: parsedCommandLine.options });
-    tsProgram.emit(
-      undefined,
-      (fileName, data) => {
-        const absolutePath = path.resolve(fileName);
-        this.outputMap.set(absolutePath, data);
-        this.log('info', `Compiled ${absolutePath}`);
-      },
-      undefined,
-      false,
-      this.originalOptions?.typescript?.customTransformers,
-    );
-    const result = _.attempt(() =>
-      ts
-        .getOutputFileNames(parsedCommandLine, path.relative(process.cwd(), path.resolve(this.options.entry)), false)
-        .find((filePath) => filePath.endsWith('.js')),
-    );
-    if (result instanceof Error) return undefined;
-    return result;
-  })(this.tsConfig, this.configPath);
-
-  protected readonly virtualEntryFileContent = ((entryFilePath) => {
-    if (StringUtil.isFalsyString(entryFilePath)) return undefined;
-    if (typeof this.originalOptions.getVirtualEntryFileContent !== 'function') return undefined;
-    return this.originalOptions.getVirtualEntryFileContent!(entryFilePath!);
-  })(path.resolve(this.buildEntryFilePath!));
-
-  protected readonly finalBuildEntryFilePath =
-    typeof this.buildEntryFilePath === 'undefined'
-      ? null
-      : StringUtil.isFalsyString(this.virtualEntryFileContent)
-        ? this.buildEntryFilePath
-        : path.resolve(
-            path.dirname(this.buildEntryFilePath),
-            `entry-${Date.now()}-${Math.random().toString(16).slice(2)}.js`,
-          );
-
-  protected readonly virtualEntryMode = this.buildEntryFilePath !== this.finalBuildEntryFilePath;
-
   public constructor(protected readonly originalOptions: ForgeOptions) {}
 
   public async run(options?: RunOptions) {
     await init;
 
+    const outputMap = new Map<string, string>();
     const runOptions = _.attempt(() => RUN_OPTIONS_SCHEMA.parse(options || {}));
 
     if (runOptions instanceof Error) {
@@ -126,7 +76,41 @@ export class Forge {
       return;
     }
 
-    if (this.finalBuildEntryFilePath === null) {
+    const tsConfig = ((configPath: string) => {
+      return ts.parseJsonConfigFileContent(
+        ts.readConfigFile(configPath, ts.sys.readFile).config,
+        ts.sys,
+        path.dirname(configPath),
+      );
+    })(this.configPath);
+    tsConfig.options.configFilePath = this.configPath;
+    const buildEntryFilePath = ((parsedCommandLine: ts.ParsedCommandLine) => {
+      const result = _.attempt(() =>
+        ts
+          .getOutputFileNames(parsedCommandLine, path.relative(process.cwd(), path.resolve(this.options.entry)), false)
+          .find((filePath) => filePath.endsWith('.js')),
+      );
+      if (result instanceof Error) return undefined;
+      return result;
+    })(tsConfig);
+    const virtualEntryFileContent = ((entryFilePath) => {
+      if (StringUtil.isFalsyString(entryFilePath)) return undefined;
+      if (typeof this.originalOptions.getVirtualEntryFileContent !== 'function') return undefined;
+      return this.originalOptions.getVirtualEntryFileContent!(entryFilePath!);
+    })(path.resolve(buildEntryFilePath!));
+
+    const finalBuildEntryFilePath =
+      typeof buildEntryFilePath === 'undefined'
+        ? null
+        : StringUtil.isFalsyString(virtualEntryFileContent)
+          ? buildEntryFilePath
+          : path.resolve(
+              path.dirname(buildEntryFilePath),
+              `entry-${Date.now()}-${Math.random().toString(16).slice(2)}.js`,
+            );
+    const virtualEntryMode = buildEntryFilePath !== finalBuildEntryFilePath;
+
+    if (finalBuildEntryFilePath === null) {
       this.log(
         'error',
         `Failed to determine entry output path: No .js output file found for entry ${this.options.entry}`,
@@ -134,7 +118,7 @@ export class Forge {
       return;
     }
 
-    this.log('info', `Using entry file: ${this.finalBuildEntryFilePath}`);
+    this.log('info', `Using entry file: ${finalBuildEntryFilePath}`);
 
     const loadObfuscatorConfig = (): ObfuscatorOptions => {
       if (StringUtil.isFalsyString(runOptions.obfuscatorConfigFilePath)) return {};
@@ -151,7 +135,7 @@ export class Forge {
 
     const esbuildContext = await AttemptUtil.execPromise(
       esbuild.context({
-        entryPoints: [path.resolve(this.finalBuildEntryFilePath)],
+        entryPoints: [path.resolve(finalBuildEntryFilePath)],
         bundle: true,
         platform: 'node',
         loader: {
@@ -163,7 +147,40 @@ export class Forge {
         define: runOptions.definitions,
         plugins: [
           {
-            name: 'watch-result',
+            name: 'tsconfig-paths',
+            setup: (build) => {
+              build.onResolve({ filter: /.*/ }, (args) => {
+                const hasMatchingPath = Object.keys(tsConfig.options?.paths || {}).some((path) =>
+                  new RegExp(path.replace('*', '\\w*')).test(args.path),
+                );
+
+                if (!hasMatchingPath) {
+                  return null;
+                }
+
+                const { resolvedModule } = ts.nodeModuleNameResolver(
+                  args.path,
+                  args.importer,
+                  tsConfig.options || {},
+                  ts.sys,
+                );
+
+                if (!resolvedModule) return null;
+
+                const { resolvedFileName } = resolvedModule;
+
+                if (!resolvedFileName || resolvedFileName.endsWith('.d.ts')) return null;
+
+                const resolved = ts.sys.resolvePath(resolvedFileName);
+
+                this.log('info', `Resolved file using TypeScript paths: ${args.path} -> ${resolved})`);
+
+                return { path: resolved };
+              });
+            },
+          },
+          {
+            name: 'forge',
             setup: (build) => {
               build.onEnd((result) => {
                 if (result.errors.length > 0) {
@@ -196,46 +213,9 @@ export class Forge {
 
                 this.handleOutputFile(absoluteOutputFile, resultCode!, !!runOptions.watch);
               });
-            },
-          },
-          {
-            name: 'tsconfig-paths',
-            setup: (build) => {
-              build.onResolve({ filter: /.*/ }, (args) => {
-                const hasMatchingPath = Object.keys(this.tsConfig.options?.paths || {}).some((path) =>
-                  new RegExp(path.replace('*', '\\w*')).test(args.path),
-                );
 
-                if (!hasMatchingPath) {
-                  return null;
-                }
-
-                const { resolvedModule } = ts.nodeModuleNameResolver(
-                  args.path,
-                  args.importer,
-                  this.tsConfig.options || {},
-                  ts.sys,
-                );
-
-                if (!resolvedModule) return null;
-
-                const { resolvedFileName } = resolvedModule;
-
-                if (!resolvedFileName || resolvedFileName.endsWith('.d.ts')) return null;
-
-                const resolved = ts.sys.resolvePath(resolvedFileName);
-
-                this.log('info', `Resolved file using TypeScript paths: ${args.path} -> ${resolved})`);
-
-                return { path: resolved };
-              });
-            },
-          },
-          {
-            name: 'forge',
-            setup: (build) => {
               build.onResolve({ filter: /.*/ }, async (args) => {
-                if (this.virtualEntryMode && StringUtil.isFalsyString(args.importer)) {
+                if (virtualEntryMode && StringUtil.isFalsyString(args.importer)) {
                   return { path: args.path, namespace: 'virtual-entry' };
                 }
 
@@ -248,9 +228,9 @@ export class Forge {
                   return { path: args.path, external: true };
                 }
 
-                if (this.outputMap.has(args.path)) return { path: args.path, namespace: 'vfs' };
+                if (outputMap.has(args.path)) return { path: args.path, namespace: 'vfs' };
 
-                if (this.outputMap.has(args.importer)) {
+                if (outputMap.has(args.importer)) {
                   const targetPaths: string[] = [];
                   const absoluteImportPath = path.resolve(path.dirname(args.importer), args.path);
 
@@ -264,7 +244,7 @@ export class Forge {
                   }
 
                   for (const targetPath of targetPaths) {
-                    if (this.outputMap.has(targetPath)) {
+                    if (outputMap.has(targetPath)) {
                       return { path: targetPath, namespace: 'vfs' };
                     }
                   }
@@ -293,7 +273,7 @@ export class Forge {
                   );
 
                   if (!(requiredPath instanceof Error)) {
-                    return { path: requiredPath, namespace: this.outputMap.has(requiredPath) ? 'vfs' : undefined };
+                    return { path: requiredPath, namespace: outputMap.has(requiredPath) ? 'vfs' : undefined };
                   }
                 }
 
@@ -302,13 +282,13 @@ export class Forge {
 
               build.onLoad({ filter: /.*/, namespace: 'virtual-entry' }, () => {
                 return {
-                  contents: this.virtualEntryFileContent!,
+                  contents: virtualEntryFileContent!,
                   loader: 'js',
                 };
               });
 
               build.onLoad({ filter: /.*/, namespace: 'vfs' }, (args) => {
-                const contents = this.outputMap.get(args.path);
+                const contents = outputMap.get(args.path);
                 return {
                   contents,
                   loader: 'js',
@@ -374,15 +354,21 @@ export class Forge {
       return;
     }
 
-    if (runOptions.watch) {
-      await esbuildContext.watch();
-      this.emitter.on(RUNNER_EXIT, async () => {
-        await esbuildContext.rebuild();
-      });
-    } else {
-      await esbuildContext.rebuild();
-      await esbuildContext.dispose();
-    }
+    const tsProgram = ts.createProgram({ rootNames: tsConfig.fileNames, options: tsConfig.options });
+
+    tsProgram.emit(
+      undefined,
+      (fileName, data) => {
+        const absolutePath = path.resolve(fileName);
+        outputMap.set(absolutePath, data);
+        this.log('info', `Compiled ${absolutePath}`);
+      },
+      undefined,
+      false,
+      this.originalOptions?.typescript?.customTransformers,
+    );
+    await esbuildContext.rebuild();
+    await esbuildContext.dispose();
   }
 
   protected log(level: Schema.LogLevel, ...messages: string[]) {
@@ -394,9 +380,15 @@ export class Forge {
 
     if (!watchMode || !this.options.executeAfterBuild) return;
 
+    Array.from(this.workers).forEach((worker) => {
+      _.attempt(() => worker.terminate());
+    });
+
     this.log('info', `Executing output file ${filePath}`);
 
     const worker = new Worker(content!, { eval: true });
+
+    this.workers.add(worker);
 
     worker.on('error', (error) => {
       this.log('error', `Bundle execution error: ${error.message}`);
@@ -405,7 +397,7 @@ export class Forge {
 
     worker.on('exit', (code) => {
       this.log('info', `Bundle execution exited with code ${code}`);
-      this.emitter.emit(RUNNER_EXIT);
+      this.workers.delete(worker);
     });
   }
 }
