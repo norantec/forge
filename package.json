@@ -1,6 +1,6 @@
 {
   "name": "@open-norantec/forge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Forge is a builder for all TypeScript projects",
   "main": "dist/index.js",
   "scripts": {
@@ -22,27 +22,33 @@
   "bin": {
     "forge": "./dist/cli.js"
   },
+  "overrides": {
+    "into-stream": "5.0.0"
+  },
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org"
   },
   "homepage": "https://github.com/norantec/forge#readme",
   "dependencies": {
-    "@open-norantec/utilities": "^1.0.0-alpha.20",
-    "@yao-pkg/pkg": "^6.5.1",
+    "@open-norantec/utilities": "^1.0.1-alpha.15",
+    "@yao-pkg/pkg": "6.5.1",
     "ajv": "^8.17.1",
-    "chalk": "^5.6.0",
+    "chalk": "^4.1.2",
     "chokidar": "^3.6.0",
     "commander": "^12.0.0",
     "fs-extra": "^11.1.1",
     "ignore": "^7.0.5",
+    "javascript-obfuscator": "^5.4.1",
     "lodash": "^4.17.21",
     "memfs": "^4.17.2",
+    "require-from-string": "^2.0.2",
     "source-map-support": "^0.5.21",
     "terser-webpack-plugin": "^5.3.14",
     "ts-loader": "^9.5.2",
     "type-fest": "^4.41.0",
     "webpack": "5.97.1",
+    "webpack-merge": "^6.0.1",
     "webpack-virtual-modules": "^0.6.2",
     "zod": "^3.25.67"
   },
@@ -51,6 +57,7 @@
     "@types/fs-extra": "^11.0.4",
     "@types/lodash": "^4.17.16",
     "@types/node": "18.11.18",
+    "@types/require-from-string": "^1.2.3",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "cross-env": "^7.0.3",
