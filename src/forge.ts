@@ -1,891 +1,463 @@
-/* eslint-disable @typescript-eslint/no-this-alias */
-import * as ts from 'typescript';
-import * as path from 'node:path';
-import * as fs from 'node:fs';
 import { z } from 'zod';
-import * as webpack from 'webpack';
-import TerserPlugin = require('terser-webpack-plugin');
-import VirtualModulesPlugin = require('webpack-virtual-modules');
-import { StringUtil } from '@open-norantec/utilities/dist/string-util.class';
+import { init, parse as parseESModuleLex } from 'es-module-lexer';
+import { Schema } from '@open-norantec/utilities/dist/schema-util.class';
 import * as _ from 'lodash';
-import * as memfs from 'memfs';
-import { Worker } from 'node:worker_threads';
-import * as chokidar from 'chokidar';
-import * as ignore from 'ignore';
-import * as readline from 'node:readline';
-import * as chalk from 'chalk';
-import { Schema, SchemaUtil } from '@open-norantec/utilities/dist/schema-util.class';
-import { Command } from 'commander';
-import * as originalFs from 'fs';
-import * as originalFsPromises from 'fs/promises';
-import { VMUtil } from '@open-norantec/utilities/dist/vm-util.class';
-import { fork } from 'node:child_process';
-import { LogUtil } from '@open-norantec/utilities/dist/log-util.class';
+import * as ts from 'typescript';
+import * as esbuild from 'esbuild';
+import * as path from 'path';
+import { AttemptUtil } from '@open-norantec/utilities/dist/attempt-util.class';
+import * as module from 'node:module';
+import * as babel from '@babel/core';
 import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
 import * as requireFromString from 'require-from-string';
-import { merge } from 'webpack-merge';
-
-export type LogHandler = (level: Schema.LogLevel, message?: string) => void;
-
-const IS_FORKED = typeof process?.send === 'function';
-
-function loadObfuscatorConfig(obfuscatorConfigFilePath: string): ObfuscatorOptions {
-  if (StringUtil.isFalsyString(obfuscatorConfigFilePath)) return {};
-
-  const absoluteObfuscatorConfigFilePath = path.resolve(obfuscatorConfigFilePath!);
-
-  if (!fs.existsSync(absoluteObfuscatorConfigFilePath) || !fs.statSync(absoluteObfuscatorConfigFilePath).isFile()) {
-    return {};
-  }
-
-  const obfuscatorConfig = _.attempt(() =>
-    requireFromString(fs.readFileSync(absoluteObfuscatorConfigFilePath).toString()),
-  );
-
-  if (obfuscatorConfig instanceof Error) return {};
-
-  return obfuscatorConfig;
-}
-
-function loadBuildConfig(buildConfigFilePath: string): webpack.Configuration {
-  if (StringUtil.isFalsyString(buildConfigFilePath)) return {};
-
-  const absoluteBuildConfigFilePath = path.resolve(buildConfigFilePath!);
-
-  if (!fs.existsSync(absoluteBuildConfigFilePath) || !fs.statSync(absoluteBuildConfigFilePath).isFile()) {
-    return {};
-  }
-
-  const buildConfig = _.attempt(() =>
-    _.pick(requireFromString(fs.readFileSync(absoluteBuildConfigFilePath).toString()), ['externals']),
-  );
-
-  if (buildConfig instanceof Error || !_.isObjectLike(buildConfig)) return {};
-
-  return buildConfig as webpack.Configuration;
-}
-
-function renderProgressBar(percent: number, message: string, file: string) {
-  const barLength = 40;
-  const filledLength = Math.round((percent / 100) * barLength);
-  const bar = `${'='.repeat(filledLength)}${'-'.repeat(barLength - filledLength)}`;
-
-  readline.clearLine(process.stdout, 0);
-  readline.cursorTo(process.stdout, 0);
-  process.stdout.write(
-    `${chalk.green(`[${bar}]`)} ${chalk.yellow(`${percent}%`)} ${chalk.gray(message)} ${chalk.cyan(file)}`,
-  );
-
-  if (percent === 100) {
-    process.stdout.write('\n');
-  }
-}
-
-class VirtualFilePlugin {
-  public constructor(private readonly volume: memfs.IFs) {}
-
-  public apply(compiler: webpack.Compiler) {
-    compiler.outputFileSystem = this.volume as webpack.OutputFileSystem;
-  }
-}
-
-class CatchNotFoundPlugin {
-  public constructor(private onLog?: LogHandler) {}
-  public apply(resolver: webpack.Resolver) {
-    const onLog = this.onLog;
-    const resolve = resolver.resolve;
-    resolver.resolve = function (context: Record<string, any>, currentPath, request, resolveContext, callback) {
-      const self: CatchNotFoundPlugin = this;
-      resolve.call(self, context, currentPath, request, resolveContext, (error, innerPath, result) => {
-        const notfoundPathname = path.resolve(__dirname, '../preserved/@@notfound.js') + `?${request}`;
-        if (result) {
-          return callback(null, innerPath, result);
-        }
-        if (error && !error.message.startsWith("Can't resolve")) {
-          return callback(error);
-        }
-        // Allow .js resolutions to .tsx? from .tsx?
-        if (
-          request.endsWith('.js') &&
-          context.issuer &&
-          (context.issuer.endsWith('.ts') || context.issuer.endsWith('.tsx'))
-        ) {
-          return resolve.call(
-            self,
-            context,
-            currentPath,
-            request.slice(0, -3),
-            resolveContext,
-            (error1, innerPath, result) => {
-              if (result) return callback(null, innerPath, result);
-              if (error1 && !error1.message.startsWith("Can't resolve")) return callback(error1);
-              // make not found errors runtime errors
-              callback(null, notfoundPathname, {
-                path: result,
-                context,
-              });
-            },
-          );
-        }
-        onLog?.('verbose', `Notfound '${context.issuer}' from '${request}', skipping...`);
-        // make not found errors runtime errors
-        callback(null, notfoundPathname, {
-          path: result,
-          context,
-        });
-      });
-    };
-  }
-}
-
-class CleanNonJSFilePlugin {
-  public apply(compiler: webpack.Compiler) {
-    compiler.hooks.compilation.tap(CleanNonJSFilePlugin.name, (compilation) => {
-      compilation.hooks.processAssets.tap(
-        {
-          name: CleanNonJSFilePlugin.name,
-          stage: webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE,
-        },
-        (assets) => {
-          Object.keys(assets).forEach((key) => {
-            if (!key?.endsWith?.('.js')) {
-              _.unset(assets, key);
-            }
-          });
-        },
-      );
-    });
-  }
-}
-
-class ForceWriteBundlePlugin {
-  public constructor(
-    private readonly outputPath: string,
-    private readonly obfuscate: boolean,
-    private readonly obfuscatorOptions?: ObfuscatorOptions,
-  ) {}
-
-  public apply(compiler: webpack.Compiler) {
-    compiler.hooks.compilation.tap(ForceWriteBundlePlugin.name, (compilation) => {
-      compilation.hooks.processAssets.tap(
-        {
-          name: ForceWriteBundlePlugin.name,
-          stage: webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE,
-        },
-        (assets) => {
-          Object.entries(assets).forEach(([pathname, asset]) => {
-            const absolutePath = path.resolve(this.outputPath, pathname);
-            let fileContentBuffer = _.attempt(() => asset?.buffer?.() as NodeJS.ArrayBufferView);
-
-            if (fileContentBuffer instanceof Error || !Buffer.isBuffer(fileContentBuffer)) return;
-
-            _.attempt(() => {
-              fs.mkdirSync(path.dirname(absolutePath), { recursive: true });
-            });
-
-            if (this.obfuscate) {
-              fileContentBuffer = _.attempt(
-                () =>
-                  Buffer.from(
-                    obfuscate(fileContentBuffer.toString(), this.obfuscatorOptions).getObfuscatedCode(),
-                  ) as NodeJS.ArrayBufferView,
-              );
-            }
-
-            if (fileContentBuffer instanceof Error) return;
-
-            fs.writeFileSync(absolutePath, fileContentBuffer);
-          });
-        },
-      );
-    });
-  }
-}
-
-class CompilePlugin {
-  public constructor(
-    private readonly absoluteOutputPath: string,
-    private readonly volume: memfs.IFs,
-    private readonly onLog?: LogHandler,
-  ) {}
-
-  public apply(compiler: webpack.Compiler) {
-    compiler.hooks.compilation.tap(CompilePlugin.name, (compilation) => {
-      compilation.hooks.processAssets.tap(
-        {
-          name: CompilePlugin.name,
-          stage: webpack.Compilation.PROCESS_ASSETS_STAGE_OPTIMIZE,
-        },
-        (assets) => {
-          const relativePath = Object.keys(assets).find((currentRelativePath) => {
-            return currentRelativePath?.endsWith?.('.js');
-          });
-
-          if (StringUtil.isFalsyString(relativePath)) return;
-
-          try {
-            const nodeVersion = process.version.split('.')[0].replace(/^v/g, '');
-            const absoluteBundlePath = path.resolve(this.absoluteOutputPath, relativePath!);
-
-            const matchBundlePath = (pathname: originalFs.PathLike) => {
-              return typeof pathname === 'string' && path.resolve(pathname) === absoluteBundlePath;
-            };
-            const createPatchedFsMethod = <T extends (...args: any[]) => any>(
-              proxiedFn: (...args: any[]) => any,
-              originalFn: (...args: Parameters<T>) => ReturnType<T>,
-              isPromise = false,
-            ): T => {
-              return ((pathname: string, ...args) => {
-                if (matchBundlePath(pathname)) {
-                  if (isPromise) {
-                    return new Promise((resolve, reject) => {
-                      try {
-                        resolve(proxiedFn?.(pathname, ...args));
-                      } catch (error) {
-                        reject(error);
-                      }
-                    });
-                  } else {
-                    return proxiedFn?.(pathname, ...args);
-                  }
-                }
-                return originalFn?.(...([pathname, ...args] as Parameters<T>));
-              }) as T;
-            };
-            const proxiedFsPromises: typeof originalFsPromises = {
-              ...originalFsPromises,
-              ...['stat', 'lstat', 'readFile', 'readdir', 'rm'].reduce(
-                (result, methodName) => {
-                  result[methodName] = createPatchedFsMethod(
-                    this.volume[`${methodName}Sync`].bind(this.volume),
-                    originalFsPromises[methodName].bind(originalFsPromises),
-                    true,
-                  );
-                  return result;
-                },
-                {} as Partial<typeof originalFsPromises>,
-              ),
-            };
-            const proxiedFs: typeof originalFs = {
-              ...originalFs,
-              ...['existsSync', 'realpathSync'].reduce((result, methodName) => {
-                result[methodName] = createPatchedFsMethod(
-                  this.volume[methodName].bind(this.volume),
-                  originalFs[methodName].bind(originalFs),
-                );
-                return result;
-              }, {}),
-              promises: {
-                ...originalFs.promises,
-                ...proxiedFsPromises,
-              },
-            };
-
-            this.volume.mkdirSync(path.dirname(absoluteBundlePath), { recursive: true });
-            this.volume.writeFileSync(absoluteBundlePath, assets[relativePath!]?.buffer?.());
-            VMUtil.runScriptCode(
-              `
-                const Module = require('module');
-                const originalLoad = Module._load;
-                Module._load = function(request, parent) {
-                  if (request === 'fs' || request === 'node:fs') return proxiedFs;
-                  if (request === 'fs/promises' || request === 'node:fs/promises') return proxiedFsPromises;
-                  return originalLoad.apply(this, arguments);
-                };
-                const { exec } = require('@yao-pkg/pkg');
-                exec(['${absoluteBundlePath}', '--target', '${['linux', 'macos', 'win'].map((os) => `node${nodeVersion}-${os}-${process.arch}`)}', '--out-path', '${this.absoluteOutputPath}']);
-                proxiedFs.unlinkSync('${absoluteBundlePath}');
-              `,
-              {
-                volume: this.volume,
-                proxiedFs,
-                proxiedFsPromises,
-              },
-            );
-
-            _.unset(assets, relativePath!);
-          } catch (error) {
-            this.onLog?.('error', `Error compiling to binary: ${error?.message}, stack: ${error?.stack?.toString?.()}`);
-            process.exit(1);
-          }
-        },
-      );
-    });
-  }
-}
-
-const AFTER_EMIT_ACTION_SCHEMA = z.enum(['watch', 'run-once', 'compile', 'none', 'disable-writing']).default('none');
+import { StringUtil } from '@open-norantec/utilities/dist/string-util.class';
+import { Worker } from 'node:worker_threads';
+import * as crypto from 'node:crypto';
 
 const FORGE_OPTIONS_SCHEMA = z.object({
-  afterEmitAction: z.union([AFTER_EMIT_ACTION_SCHEMA, z.undefined()]),
-  buildConfigFile: z.union([z.string(), z.undefined()]),
-  clean: z.union([z.boolean().default(true), z.undefined()]),
-  debug: z.union([z.boolean().default(false), z.undefined()]),
-  define: z.union([z.array(z.string()).default([]), z.undefined()]),
-  definitions: z.union([z.string(), z.undefined()]),
-  entry: z.union([z.string().default('main.ts'), z.undefined()]),
-  logLevel: z.union([SchemaUtil.LOG_LEVEL.default('info'), z.literal(false), z.undefined()]),
-  mode: z.union([z.enum(['development', 'production']).default('production'), z.undefined()]),
-  obfuscate: z.union([z.boolean().default(false), z.undefined()]),
-  obfuscatorConfigFile: z.union([z.string(), z.undefined()]),
-  outputDir: z.union([z.string().default('dist'), z.undefined()]),
-  outputName: z.union([z.string().default('main'), z.undefined()]),
-  outputNameFormat: z.union([z.string().default('[name].js'), z.undefined()]),
-  sourceDir: z.union([z.string().default('src'), z.undefined()]),
-  tsCompiler: z.string().optional(),
-  tsProject: z.union([z.string().default('tsconfig.json'), z.undefined()]),
-  workDir: z.union([z.string().default(process.cwd()), z.undefined()]),
+  bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]),
+  cwd: z.string().nonempty(),
+  define: z.array(z.string().nonempty()).optional(),
+  definitionsFile: z.string().nonempty().optional(),
+  entry: z.string().nonempty(),
+  executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
+  obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
+  obfuscatorConfigFilePath: z.string().optional(),
+  outputFile: z.string().nonempty(),
+  tsProject: z.union([z.string().nonempty().default('tsconfig.json'), z.undefined()]),
+  watch: z.union([z.boolean().optional().default(false), z.undefined()]),
 });
 
-type ForgeBaseOptions = Omit<z.infer<typeof FORGE_OPTIONS_SCHEMA>, 'obfuscatorConfigFile' | 'buildConfigFile'>;
-type AfterEmitAction = z.infer<typeof AFTER_EMIT_ACTION_SCHEMA>;
+export type ForgeSerializableOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
 
-const FORKED_FORGE_OPTIONS_ENV_NAME = 'FORKED_FORGE_OPTIONS';
-const FORKED_FORGE_OPTIONS_SCHEMA = z
-  .object({
-    entryFileContent: z.string(),
-  })
-  .merge(FORGE_OPTIONS_SCHEMA);
-
-const MESSAGE_SCHEMA = z.discriminatedUnion('type', [
-  z.object({
-    type: z.literal('log'),
-    level: SchemaUtil.LOG_LEVEL,
-    message: z.string().optional(),
-  }),
-]);
-
-type Message = z.infer<typeof MESSAGE_SCHEMA>;
-
-export interface ForgeContext {
-  entryDirPath: string;
-  entryFilePath: string;
-  options: ForgeBaseOptions;
-  outputPath: string;
-  tsConfig: ts.ParsedCommandLine;
-  virtualEntryFilePath: string;
-}
-
-export type ForgeOptions = ForgeBaseOptions & {
-  getEntryFileContent?: (context: ForgeContext) => string;
-  onFile?: (content: Buffer) => void | Promise<void>;
-  onLog?: LogHandler;
-  onProgress?: (percentage: number, message: string, ...params: string[]) => void;
+export type Watcher = {
+  close: () => void | Promise<void>;
 };
 
+export interface ForgeUnserializableOptions {
+  typescript?: {
+    customTransformers?: ts.CustomTransformers;
+  };
+  getVirtualEntryFileContent?: (buildEntryFilePath: string) => string;
+  getWatcher?: (callback: (filePath: string) => void | Promise<void>) => Watcher;
+  onGetFileContent: (filePath: string) => string;
+  onOutputFile: (filePath: string, content: string) => void;
+  onLog?: (level: Schema.LogLevel, message?: string) => void;
+  rewriteOutputFile?: (code: string) => string;
+}
+
+export type ForgeOptions = ForgeSerializableOptions & ForgeUnserializableOptions;
+
+function maybeESModule(code: string) {
+  const [imports, exports] = parseESModuleLex(code);
+  return imports.length > 0 || exports.length > 0;
+}
+
 export class Forge {
-  protected options: ForgeOptions;
-  protected tsConfig: ts.ParsedCommandLine;
-  protected entryFilePath: string;
-  protected entryDirPath: string;
-  protected outputPath: string;
-  protected virtualEntryFilePath: string;
-  protected definitions: Record<string, string> = {};
+  protected readonly WORKERS = new Set<Worker>();
+  protected readonly CONCERNED_FILES = new Map<string, string>();
 
-  public constructor(
-    private readonly inputOptions: ForgeOptions,
-    private readonly obfuscatorConfig: ObfuscatorOptions,
-    private readonly buildConfig: webpack.Configuration = {},
-  ) {
-    this.options = FORGE_OPTIONS_SCHEMA.parse(this.inputOptions);
-    const configPath = ts.findConfigFile(this.options.workDir!, ts.sys.fileExists, this.options.tsProject!);
+  protected readonly options: ForgeSerializableOptions = ((originalOptions: ForgeOptions) => {
+    return FORGE_OPTIONS_SCHEMA.parse(originalOptions);
+  })(this.originalOptions);
 
-    if (!configPath) throw new Error('Could not find a valid tsconfig.json.');
+  protected readonly watcher =
+    typeof this.originalOptions.getWatcher !== 'function' || !this.options?.watch
+      ? { close: () => {} }
+      : ((originalOptions: ForgeOptions, CONCERNED_FILES: typeof this.CONCERNED_FILES, run: typeof this.run) => {
+          const rerun = _.debounce(run.bind(this), 500);
+          return originalOptions.getWatcher!(async (filePath) => {
+            if (
+              !CONCERNED_FILES.has(filePath) ||
+              crypto.createHash('sha256').update(originalOptions.onGetFileContent(filePath)).digest('hex') ===
+                CONCERNED_FILES.get(filePath)
+            ) {
+              return;
+            }
+            await rerun();
+          });
+        })(this.originalOptions, this.CONCERNED_FILES, this.run.bind(this));
 
-    const configFile = ts.readConfigFile(configPath, ts.sys.readFile);
+  protected readonly configPath = ((tsProject: string) => ts.findConfigFile('.', ts.sys.fileExists, tsProject!)!)(
+    this.options.tsProject!,
+  );
 
-    if (configFile.error) {
-      throw new Error(
-        ts.formatDiagnosticsWithColorAndContext([configFile.error], {
-          getCanonicalFileName: (f) => f,
-          getCurrentDirectory: ts.sys.getCurrentDirectory,
-          getNewLine: () => ts.sys.newLine,
-        }),
+  public constructor(protected readonly originalOptions: ForgeOptions) {}
+
+  public async run() {
+    await init;
+
+    const outputMap = new Map<string, string>();
+    const tsConfig = ((configPath: string) => {
+      return ts.parseJsonConfigFileContent(
+        ts.readConfigFile(configPath, ts.sys.readFile).config,
+        ts.sys,
+        path.dirname(configPath),
       );
-    }
+    })(this.configPath);
 
-    this.tsConfig = ts.parseJsonConfigFileContent(configFile.config, ts.sys, path.dirname(configPath));
-    this.entryFilePath = path.resolve(this.options.workDir!, this.options.sourceDir!, this.options.entry!);
-    this.entryDirPath = path.dirname(this.entryFilePath);
-    this.outputPath = path.resolve(this.options.workDir!, this.options.outputDir!);
-    this.virtualEntryFilePath = path.resolve(this.entryDirPath, `virtual_${Math.random().toString(32).slice(2)}.ts`);
-
-    try {
-      if (!StringUtil.isFalsyString(this.options.definitions)) {
-        Object.entries(JSON.parse(fs.readFileSync(path.resolve(this.options.definitions!)).toString())).forEach(
-          ([key, rawValue]) => {
-            try {
-              this.definitions[key] = JSON.stringify(rawValue);
-            } catch {}
-          },
+    if (!!this.options.watch) {
+      Array.from(this.CONCERNED_FILES.keys()).forEach((filePath) => this.CONCERNED_FILES.delete(filePath));
+      tsConfig.fileNames.forEach((fileName) => {
+        const filePath = this.pathResolve(fileName);
+        this.CONCERNED_FILES.set(
+          filePath,
+          crypto.createHash('sha256').update(this.originalOptions.onGetFileContent(filePath)).digest('hex'),
         );
-      }
-    } catch {}
-
-    if (Array.isArray(this.options.define)) {
-      this.options.define!.forEach((defineString) => {
-        try {
-          const [rawKey, rawValue] = defineString.split(/\s*\:\s*/g);
-          const key = JSON.parse(rawKey);
-          const value = JSON.parse(rawValue);
-          this.definitions[key] = JSON.stringify(value);
-        } catch {}
       });
     }
 
-    this.handleLog('info', `Use definitions: ${JSON.stringify(this.definitions)}`);
-  }
-
-  public async run(): Promise<webpack.Stats | undefined> {
-    const context: ForgeContext = {
-      entryDirPath: this.entryDirPath,
-      entryFilePath: this.entryFilePath,
-      options: this.options,
-      outputPath: this.outputPath,
-      tsConfig: this.tsConfig,
-      virtualEntryFilePath: this.virtualEntryFilePath,
-    };
-
-    if (this.options.mode === 'production') {
-      const diagnostics = ts.getPreEmitDiagnostics(
-        ts.createProgram({
-          rootNames: this.tsConfig.fileNames,
-          options: this.tsConfig.options,
-        }),
+    tsConfig.options.configFilePath = this.configPath;
+    const buildEntryFilePath = ((parsedCommandLine: ts.ParsedCommandLine) => {
+      const result = _.attempt(() =>
+        ts
+          .getOutputFileNames(
+            parsedCommandLine,
+            path.relative(this.options.cwd, this.pathResolve(this.options.entry)),
+            false,
+          )
+          .find((filePath) => filePath.endsWith('.js')),
       );
-      if (diagnostics?.length > 0) {
-        diagnostics.forEach((diagnostic) => {
-          const message = ts.flattenDiagnosticMessageText(diagnostic.messageText, '\n');
-          if (diagnostic.file) {
-            const { line, character } = diagnostic.file.getLineAndCharacterOfPosition(diagnostic.start!);
-            const fileName = path.relative(process.cwd(), diagnostic.file.fileName);
-            this.inputOptions?.onLog?.('error', `❌ ${fileName} (${line + 1},${character + 1}): ${message}`);
-          } else {
-            this.inputOptions?.onLog?.('error', `❌ ${message}`);
-          }
-        });
-        return;
-      }
+      if (result instanceof Error) return undefined;
+      return result;
+    })(tsConfig);
+    const virtualEntryFileContent = ((entryFilePath) => {
+      if (StringUtil.isFalsyString(entryFilePath)) return undefined;
+      if (typeof this.originalOptions.getVirtualEntryFileContent !== 'function') return undefined;
+      return this.originalOptions.getVirtualEntryFileContent!(entryFilePath!);
+    })(this.pathResolve(buildEntryFilePath!));
+
+    const finalBuildEntryFilePath =
+      typeof buildEntryFilePath === 'undefined'
+        ? null
+        : StringUtil.isFalsyString(virtualEntryFileContent)
+          ? buildEntryFilePath
+          : this.pathResolve(
+              path.dirname(buildEntryFilePath),
+              `entry-${Date.now()}-${Math.random().toString(16).slice(2)}.js`,
+            );
+    const virtualEntryMode = buildEntryFilePath !== finalBuildEntryFilePath;
+
+    if (finalBuildEntryFilePath === null) {
+      this.log(
+        'error',
+        `Failed to determine entry output path: No .js output file found for entry ${this.options.entry}`,
+      );
+      return;
     }
 
-    const entryFileContent = (() => {
-      if (typeof this.inputOptions?.getEntryFileContent === 'function') {
-        const content = this.inputOptions.getEntryFileContent(context);
-        if (StringUtil.isFalsyString(content)) {
-          return fs.readFileSync(this.entryFilePath).toString();
-        } else {
-          return content;
-        }
-      }
-      return fs.readFileSync(this.entryFilePath).toString();
-    })();
+    this.log('info', `Using entry file: ${finalBuildEntryFilePath}`);
 
-    if (!IS_FORKED && this.options.afterEmitAction! === 'watch') {
-      const createFork = async () => {
-        return new Promise((resolve, reject) => {
-          const childProcess = fork(__filename, {
-            env: {
-              ...process.env,
-              [FORKED_FORGE_OPTIONS_ENV_NAME]: JSON.stringify({ ...this.options, entryFileContent }),
-            },
-            stdio: 'inherit',
-          });
-          childProcess.on('message', (messageData) => {
-            try {
-              const message = MESSAGE_SCHEMA.parse(messageData);
-              switch (message.type) {
-                case 'log': {
-                  this.handleLog(message.level, message.message);
-                  break;
+    const loadObfuscatorConfig = (): ObfuscatorOptions => {
+      if (StringUtil.isFalsyString(this.options.obfuscatorConfigFilePath)) return {};
+
+      const absoluteObfuscatorConfigFilePath = this.pathResolve(this.options.obfuscatorConfigFilePath!);
+      const obfuscatorConfig = _.attempt(() =>
+        requireFromString(this.originalOptions.onGetFileContent(absoluteObfuscatorConfigFilePath)),
+      );
+
+      if (obfuscatorConfig instanceof Error) return {};
+
+      return obfuscatorConfig;
+    };
+
+    const esbuildContext = await AttemptUtil.execPromise(
+      esbuild.context({
+        entryPoints: [this.pathResolve(finalBuildEntryFilePath)],
+        bundle: true,
+        platform: 'node',
+        loader: {
+          '.node': 'base64',
+        },
+        logLevel: 'silent',
+        format: 'cjs',
+        write: false,
+        define: (() => {
+          const definitions: Record<string, string> = {};
+
+          if (!StringUtil.isFalsyString(this.options.definitionsFile)) {
+            _.attempt(() => {
+              const definitionsContent = JSON.parse(
+                this.originalOptions.onGetFileContent(path.resolve(this.options.definitionsFile!)),
+              );
+              if (!_.isPlainObject(definitionsContent)) return;
+              Object.entries(definitionsContent).forEach(([key, value]) => {
+                if (StringUtil.isFalsyString(key)) return;
+                definitions[key] = JSON.stringify(value);
+              });
+            });
+          }
+
+          if (Array.isArray(this.options.define)) {
+            this.options.define.forEach((defineItem) => {
+              const [key, value] = defineItem.split('=');
+              const parsedValue = _.attempt(() => JSON.parse(value));
+              if (StringUtil.isFalsyString(key) || parsedValue instanceof Error) return;
+              definitions[key] = JSON.stringify(parsedValue);
+            });
+          }
+
+          this.log('info', `Using definitions: ${JSON.stringify(definitions)}`);
+
+          return definitions;
+        })(),
+        plugins: [
+          {
+            name: 'tsconfig-paths',
+            setup: (build) => {
+              build.onResolve({ filter: /.*/ }, (args) => {
+                const hasMatchingPath = Object.keys(tsConfig.options?.paths || {}).some((path) =>
+                  new RegExp(path.replace('*', '\\w*')).test(args.path),
+                );
+
+                if (!hasMatchingPath) {
+                  return null;
                 }
-                default:
-                  break;
-              }
-            } catch {}
-          });
-          childProcess.on('error', (error) => reject(error));
-          childProcess.on('exit', (code) => {
-            if (typeof code === 'number' && code !== 0) {
-              reject(new Error(`Watch process exited with code ${code}`));
-            } else {
-              resolve(undefined);
-            }
-          });
-        });
-      };
-      while (true) {
-        await createFork();
-      }
-    } else {
-      return new Promise<webpack.Stats>((resolve, reject) => {
-        if (this.options?.clean && (['compile', 'none'] as AfterEmitAction[]).includes(this.options.afterEmitAction!)) {
-          this.handleLog('info', `Cleaning output directory: ${this.outputPath}`);
-          _.attempt(() => fs.rmSync(this.outputPath, { recursive: true, force: true }));
-          this.handleLog('info', 'Output directory cleaned');
-        }
 
-        if (StringUtil.isFalsyString(this.options.outputName!)) reject(new Error(`Invalid generate type`));
+                const { resolvedModule } = ts.nodeModuleNameResolver(
+                  args.path,
+                  args.importer,
+                  tsConfig.options || {},
+                  ts.sys,
+                );
 
-        const volume = new memfs.Volume() as memfs.IFs;
-        const compiler = webpack(
-          merge(
-            {
-              cache: false,
-              bail: true,
-              optimization: {
-                minimize: false,
-                minimizer: [
-                  new TerserPlugin({
-                    terserOptions: {
-                      keep_classnames: true,
-                      keep_fnames: true,
-                    },
-                  }),
-                ],
-              },
-              entry: {
-                [`${this.options.outputName!}${this.options.afterEmitAction! === 'compile' ? `-${process.arch}` : ''}`]:
-                  this.virtualEntryFilePath,
-              },
-              target: 'node',
-              mode: this.options.mode!,
-              output: {
-                devtoolModuleFilenameTemplate: '[absolute-resource-path]',
-                filename: this.options.outputNameFormat,
-                path: this.outputPath,
-                libraryTarget: 'commonjs',
-              },
-              resolve: {
-                extensions: ['.js', '.cjs', '.mjs', '.ts', '.tsx'],
-                alias: {
-                  src: path.resolve(this.options.workDir!, this.options.sourceDir!),
-                  UNKNOWN: false,
-                },
-                plugins: [
-                  new CatchNotFoundPlugin((level, message) => {
-                    this.handleLog(level, message);
-                  }),
-                ],
-              },
-              module: {
-                rules: [
-                  {
-                    test: /\.ts$/,
-                    use: {
-                      loader: require.resolve('ts-loader'),
-                      options: {
-                        ...(StringUtil.isFalsyString(this.options?.tsCompiler)
-                          ? {}
-                          : { compiler: this.options.tsCompiler! }),
-                        configFile: path.resolve(this.options.workDir!, this.options.tsProject!),
-                      },
-                    },
-                    exclude: /node_modules/,
-                  },
-                ],
-              },
-              plugins: [
-                new VirtualFilePlugin(volume),
-                new webpack.DefinePlugin(this.definitions),
-                new webpack.ProgressPlugin((percentage, message, ...args) => {
-                  if (typeof this.inputOptions?.onProgress === 'function') {
-                    this.inputOptions.onProgress(percentage, message, ...args);
+                if (!resolvedModule) return null;
+
+                const { resolvedFileName } = resolvedModule;
+
+                if (!resolvedFileName || resolvedFileName.endsWith('.d.ts')) return null;
+
+                const resolved = ts.sys.resolvePath(resolvedFileName);
+
+                this.log('info', `Resolved file using TypeScript paths: ${args.path} -> ${resolved})`);
+
+                return { path: resolved };
+              });
+            },
+          },
+          {
+            name: 'forge',
+            setup: (build) => {
+              build.onEnd((result) => {
+                if (result.errors.length > 0) {
+                  this.log('error', `Build failed with ${result.errors.length} errors`);
+                  result.errors.forEach((error) => this.log('error', error.text));
+                  return;
+                }
+
+                const absoluteOutputFile = this.pathResolve(this.options.outputFile);
+                let resultCode = result.outputFiles?.[0]?.text;
+
+                if (StringUtil.isFalsyString(resultCode)) {
+                  this.log('error', 'No output code generated');
+                  return;
+                }
+
+                if (this.options.obfuscate) {
+                  resultCode = (() => {
+                    const obfuscatedCode = _.attempt(() => {
+                      return obfuscate(resultCode!, loadObfuscatorConfig()).getObfuscatedCode();
+                    });
+                    if (obfuscatedCode instanceof Error) return resultCode;
+                    return obfuscatedCode;
+                  })();
+                }
+
+                if (typeof this.originalOptions.rewriteOutputFile === 'function') {
+                  resultCode = this.originalOptions.rewriteOutputFile!(resultCode!);
+                }
+
+                this.handleOutputFile(absoluteOutputFile, resultCode!, !!this.options.watch);
+              });
+
+              build.onResolve({ filter: /.*/ }, async (args) => {
+                if (virtualEntryMode && StringUtil.isFalsyString(args.importer)) {
+                  return { path: args.path, namespace: 'virtual-entry' };
+                }
+
+                if (
+                  args.path.startsWith('node:') ||
+                  module.builtinModules.some(
+                    (moduleName) => args.path.startsWith(moduleName) || args.path.startsWith(`${moduleName}/`),
+                  )
+                ) {
+                  return { path: args.path, external: true };
+                }
+
+                if (outputMap.has(args.path)) return { path: args.path, namespace: 'vfs' };
+
+                if (outputMap.has(args.importer)) {
+                  const targetPaths: string[] = [];
+                  const absoluteImportPath = this.pathResolve(path.dirname(args.importer), args.path);
+
+                  if (!['.js', '.cjs'].includes(path.extname(absoluteImportPath))) {
+                    targetPaths.push(absoluteImportPath + '.js');
+                    targetPaths.push(absoluteImportPath + '.cjs');
+                    targetPaths.push(this.pathResolve(absoluteImportPath, 'index.js'));
+                    targetPaths.push(this.pathResolve(absoluteImportPath, 'index.cjs'));
                   } else {
-                    renderProgressBar(Math.floor(percentage * 100), message, args[0] || '');
+                    targetPaths.push(absoluteImportPath);
                   }
-                }),
-                ...(() => {
-                  const result: any[] = [];
 
-                  result.push(
-                    new CleanNonJSFilePlugin(),
-                    new VirtualModulesPlugin({
-                      [this.virtualEntryFilePath]: entryFileContent,
+                  for (const targetPath of targetPaths) {
+                    if (outputMap.has(targetPath)) {
+                      return { path: targetPath, namespace: 'vfs' };
+                    }
+                  }
+                }
+
+                if (this.options.bundleDependencies) {
+                  const requiredPath = _.attempt(() =>
+                    require.resolve(args.path, {
+                      paths: [
+                        ...(() => {
+                          const result: string[] = [];
+                          let currentDir = path.dirname(args.importer);
+
+                          result.push(currentDir);
+
+                          while (currentDir !== path.dirname(currentDir)) {
+                            result.push(path.dirname(currentDir));
+                            currentDir = path.dirname(currentDir);
+                          }
+
+                          return result;
+                        })(),
+                        ...(require.resolve.paths('') || []),
+                      ],
                     }),
                   );
 
-                  if (
-                    !(['run-once', 'watch', 'disable-writing'] as AfterEmitAction[]).includes(
-                      this.options.afterEmitAction!,
-                    ) ||
-                    this.options?.debug
-                  ) {
-                    result.push(
-                      new ForceWriteBundlePlugin(this.outputPath, this.options.obfuscate!, this.obfuscatorConfig),
-                    );
-                    if (this.options?.debug) return result;
+                  if (!(requiredPath instanceof Error)) {
+                    return { path: requiredPath, namespace: outputMap.has(requiredPath) ? 'vfs' : undefined };
+                  }
+                }
+
+                return { path: args.path, external: true };
+              });
+
+              build.onLoad({ filter: /.*/, namespace: 'virtual-entry' }, () => {
+                return {
+                  contents: virtualEntryFileContent!,
+                  loader: 'js',
+                };
+              });
+
+              build.onLoad({ filter: /.*/, namespace: 'vfs' }, (args) => {
+                const contents = outputMap.get(args.path);
+                return {
+                  contents,
+                  loader: 'js',
+                };
+              });
+
+              build.onLoad({ filter: /node_modules\/.*.(mjs|js)$/ }, (args) => {
+                const code = _.attempt(() => this.originalOptions.onGetFileContent(args.path));
+
+                if (code instanceof Error) {
+                  this.log('error', `Failed to read file content for ${args.path}: ${code.message}`);
+                  return null;
+                }
+
+                if (maybeESModule(code)) {
+                  const transformed = _.attempt(() => {
+                    return babel.transformSync(code, {
+                      plugins: [require.resolve('@babel/plugin-transform-modules-commonjs')],
+                    });
+                  });
+
+                  if (transformed instanceof Error) {
+                    this.log('error', `Failed to transform ES module for ${args.path}: ${transformed.message}`);
+                    return {
+                      contents: code,
+                      loader: 'js',
+                    };
                   }
 
-                  if (this.options.afterEmitAction! === 'compile') {
-                    result.push(
-                      new CompilePlugin(this.outputPath, volume, (level, message) => {
-                        this.handleLog(level, message);
-                      }),
-                    );
-                  }
+                  return {
+                    contents: transformed?.code || code,
+                    loader: 'js',
+                  };
+                }
 
-                  return result;
-                })(),
-              ],
+                return {
+                  contents: code,
+                  loader: 'js',
+                };
+              });
+
+              build.onLoad({ filter: /.*/, namespace: 'json' }, (args) => {
+                const contents = _.attempt(() => this.originalOptions.onGetFileContent(args.path));
+
+                if (contents instanceof Error) {
+                  this.log('error', `Failed to read file content for ${args.path}: ${contents.message}`);
+                  return null;
+                }
+
+                return {
+                  contents: `module.exports = ${JSON.stringify(contents)}`,
+                  loader: 'js',
+                };
+              });
             },
-            this.buildConfig,
-          ),
-        );
-
-        compiler.run((error, result) => {
-          const getSourceCode = () => {
-            let sourceCode: string | null = null;
-
-            if (this.options.mode === 'development' || this.options.afterEmitAction === 'disable-writing') {
-              const bundleFileSourceFilename = Object.entries(result?.compilation?.assets ?? {}).find(([fileName]) =>
-                fileName?.endsWith?.('.js'),
-              )?.[0];
-              try {
-                sourceCode = volume
-                  .readFileSync(path.resolve(this.outputPath, bundleFileSourceFilename!))
-                  ?.toString?.();
-              } catch {}
-            } else if (this.options.mode === 'production') {
-              const bundleFileSource = Object.entries(result?.compilation?.assets ?? {}).find(([fileName]) =>
-                fileName?.endsWith?.('.js'),
-              )?.[1];
-              try {
-                sourceCode = bundleFileSource!.buffer().toString();
-              } catch {}
-            }
-
-            return sourceCode;
-          };
-
-          if (error) {
-            this.handleLog(
-              'error',
-              `Builder finished with error: ${error?.message}, stack: ${error?.stack?.toString?.()}`,
-            );
-            reject(error);
-          } else if (result instanceof webpack.Stats) {
-            switch (this.options.afterEmitAction!) {
-              case 'watch':
-              case 'run-once': {
-                const sourceCode = getSourceCode();
-
-                if (StringUtil.isFalsyString(sourceCode)) {
-                  return reject(new Error('Cannot find any file to run'));
-                }
-
-                new Worker(sourceCode!, { eval: true });
-
-                break;
-              }
-              case 'disable-writing': {
-                const sourceCode = getSourceCode();
-
-                if (StringUtil.isFalsyString(sourceCode)) {
-                  return reject(new Error('Cannot find any file to run'));
-                }
-
-                this.inputOptions?.onFile?.(Buffer.from(sourceCode!));
-
-                break;
-              }
-              default:
-                break;
-            }
-
-            resolve(result);
-          }
-        });
-      });
-    }
-  }
-
-  private handleLog(logLevel: Schema.LogLevel, message?: string) {
-    if (new LogUtil().match(this.options.logLevel!, logLevel)) {
-      this.inputOptions?.onLog?.(logLevel, message);
-    }
-  }
-}
-
-export interface CreateForgeCommandOptions extends Partial<ForgeOptions> {
-  hideOptions?: string[];
-}
-
-interface Option {
-  flags: string;
-  defaultValue?: string | boolean | string[];
-  description: string;
-  parser?: (value: string, previous: string[]) => any;
-}
-
-function collect(value: string, previous: string[]) {
-  return Array.isArray(previous) ? previous.concat(value.split(',')) : [value];
-}
-
-export const createForgeCommand = (options?: CreateForgeCommandOptions) => {
-  const command = new Command();
-
-  command.argument('<entry>', 'Entry path relative to work-dir and source-dir, e.g. main.ts');
-
-  (
-    [
-      {
-        flags: '--after-emit-action <string>',
-        description: 'Action after emitting, e.g. watch/run-once/compile',
-        defaultValue: 'none',
-      },
-      {
-        flags: '--build-config-file <string>',
-        description: 'Path to build config file for Webpack',
-      },
-      {
-        flags: '--clean',
-        description: 'Clean legacy output',
-        defaultValue: true,
-      },
-      {
-        flags: '--mode <string>',
-        description: 'Compile mode, e.g. development/production',
-      },
-      {
-        flags: '--work-dir <string>',
-        description: 'Work directory path',
-        defaultValue: process.cwd(),
-      },
-      {
-        flags: '--source-dir <string>',
-        description: 'Source directory path',
-        defaultValue: 'src',
-      },
-      {
-        flags: '--output-dir <string>',
-        description: 'Output directory path',
-        defaultValue: 'dist',
-      },
-      {
-        flags: '--obfuscate',
-        description: 'Whether to obfuscate the code',
-        defaultValue: false,
-      },
-      {
-        flags: '--obfuscator-config-file <string>',
-        description: 'Path to JavaScript obfuscator config file',
-      },
-      {
-        flags: '--output-name <string>',
-        description: 'Output file name',
-        defaultValue: 'main',
-      },
-      {
-        flags: '--output-name-format <string>',
-        description: 'Ouptput file name format',
-        defaultValue: '[name].js',
-      },
-      {
-        flags: '--ts-project <string>',
-        description: 'Path for TypeScript config file',
-        defaultValue: 'tsconfig.json',
-      },
-      {
-        flags: '--ts-compiler <string>',
-        description: 'Path or module name for TypeScript compiler',
-      },
-      {
-        flags: '--debug',
-        description: 'Debug mode',
-        defaultValue: false,
-      },
-      {
-        flags: '--log-level',
-        description: 'Log level',
-        defaultValue: 'info',
-      },
-      {
-        flags: '--definitions <string>',
-        description: 'Path for definitions JSON file',
-      },
-      {
-        flags: '--define <string>',
-        description: 'Define a single definition, e.g. --define FOO=1, prior to --definitions',
-        parser: collect,
-      },
-    ] as Option[]
-  ).forEach((item) => {
-    if (options?.hideOptions?.includes?.(item.flags.split(/\s+/g)[0])) return;
-    command.option(
-      item.flags,
-      item.description,
-      typeof item.parser === 'function' ? item.parser : (values) => values,
-      item?.defaultValue,
+          },
+        ],
+      }),
     );
-  });
 
-  command.action((entry, commandOptions) => {
-    const baseOptions = {
-      entry,
-      ...options,
-      ...commandOptions,
-    } as unknown as z.infer<typeof FORGE_OPTIONS_SCHEMA>;
-    new Forge(
-      _.omit(baseOptions, ['obfuscatorConfigFile']),
-      loadObfuscatorConfig(baseOptions.obfuscatorConfigFile!),
-      loadBuildConfig(baseOptions.buildConfigFile!),
-    ).run();
-  });
+    if (esbuildContext instanceof Error) {
+      this.log('error', `Failed to create build context: ${esbuildContext.message}`);
+      return;
+    }
 
-  return command;
-};
+    const tsProgram = ts.createProgram({ rootNames: tsConfig.fileNames, options: tsConfig.options });
 
-if (IS_FORKED && require.main === module) {
-  const handleChange = () => {
-    process.exit(0);
-  };
-  const ig = ignore().add(
-    (() => {
-      const gitIgnorePath = path.resolve('.gitignore');
-      if (fs.existsSync(gitIgnorePath) && fs.statSync(gitIgnorePath).isFile()) {
-        return fs.readFileSync(gitIgnorePath).toString();
-      }
-      return '';
-    })(),
-  );
-  const watcher = chokidar.watch(process.cwd(), {
-    persistent: true,
-    ignoreInitial: true,
-    ignored: (pathname) => {
-      const relativePath = path.relative(process.cwd(), pathname);
-      if (StringUtil.isFalsyString(relativePath)) return false;
-      if (relativePath.startsWith('.git')) return true;
-      return ig.ignores(relativePath);
-    },
-  });
-
-  watcher.on('change', handleChange);
-  watcher.on('add', handleChange);
-  watcher.on('unlink', handleChange);
-
-  const options = FORKED_FORGE_OPTIONS_SCHEMA.parse(JSON.parse(process.env?.[FORKED_FORGE_OPTIONS_ENV_NAME] as string));
-  new Forge(
-    {
-      ..._.omit(options, ['entryFileContent', 'obfuscatorConfigFile']),
-      getEntryFileContent: () => options.entryFileContent,
-      onLog: (level, message) => {
-        process.send!({
-          type: 'log',
-          level,
-          message,
-        } as Message);
+    tsProgram.emit(
+      undefined,
+      (fileName, data) => {
+        const absolutePath = this.pathResolve(fileName);
+        outputMap.set(absolutePath, data);
+        this.log('info', `Compiled ${absolutePath}`);
       },
-    },
-    loadObfuscatorConfig(options.obfuscatorConfigFile!),
-    loadBuildConfig(options.buildConfigFile!),
-  )
-    .run()
-    .catch((error) => {
-      process.send!({
-        type: 'log',
-        level: 'error',
-        message: error?.message,
-      } as Message);
-      process.exit(1);
+      undefined,
+      false,
+      this.originalOptions?.typescript?.customTransformers,
+    );
+    await esbuildContext.rebuild();
+    await esbuildContext.dispose();
+  }
+
+  protected log(level: Schema.LogLevel, ...messages: string[]) {
+    _.attempt(() => this.originalOptions?.onLog?.(level, messages?.join?.(' ')));
+  }
+
+  protected handleOutputFile(filePath: string, content: string, watchMode = false) {
+    _.attempt(() => this.originalOptions.onOutputFile(filePath, content));
+
+    if (!watchMode || !this.options.executeAfterBuild) return;
+
+    Array.from(this.WORKERS).forEach((worker) => {
+      _.attempt(() => worker.terminate());
     });
+
+    this.log('info', `Executing output file ${filePath}`);
+
+    const worker = new Worker(content!, { eval: true });
+
+    this.WORKERS.add(worker);
+
+    worker.on('error', (error) => {
+      this.log('error', `Bundle execution error: ${error.message}`);
+      _.attempt(() => worker.terminate());
+    });
+
+    worker.on('exit', (code) => {
+      this.log('info', `Current bundle execution exited (${code}), waiting for next execution...`);
+      this.WORKERS.delete(worker);
+    });
+  }
+
+  protected pathResolve(...pathSegments: string[]) {
+    return path.resolve(this.options.cwd, ...pathSegments);
+  }
 }

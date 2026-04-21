@@ -1,7 +1,7 @@
 import { Command } from 'commander';
 import { z } from 'zod';
 import * as _ from 'lodash';
-import { Forge, ForgeOptions } from './ng';
+import { Forge, ForgeOptions } from './forge';
 import * as fs from 'fs-extra';
 import * as path from 'node:path';
 import { Schema, StringUtil } from '@open-norantec/utilities';
