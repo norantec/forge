@@ -36,9 +36,7 @@ export type Watcher = {
 };
 
 export interface ForgeUnserializableOptions {
-  typescript?: {
-    customTransformers?: ts.CustomTransformers;
-  };
+  customTransformers?: (program: ts.Program) => ts.CustomTransformers;
   getVirtualEntryFileContent?: (buildEntryFilePath: string) => string;
   getWatcher?: (callback: (filePath: string) => void | Promise<void>) => Watcher;
   onGetFileContent: (filePath: string) => string;
@@ -423,7 +421,7 @@ export class Forge {
       },
       undefined,
       false,
-      this.originalOptions?.typescript?.customTransformers,
+      this.originalOptions?.customTransformers?.(tsProgram),
     );
     await esbuildContext.rebuild();
     await esbuildContext.dispose();
