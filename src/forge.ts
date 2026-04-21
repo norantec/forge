@@ -277,9 +277,7 @@ export class Forge {
 
                 if (
                   args.path.startsWith('node:') ||
-                  module.builtinModules.some(
-                    (moduleName) => args.path.startsWith(moduleName) || args.path.startsWith(`${moduleName}/`),
-                  )
+                  module.builtinModules.some((moduleName) => moduleName === args.path.split('/')[0])
                 ) {
                   return { path: args.path, external: true };
                 }
@@ -332,6 +330,8 @@ export class Forge {
                     return { path: requiredPath, namespace: outputMap.has(requiredPath) ? 'vfs' : undefined };
                   }
                 }
+
+                this.log('warn', `[EXTERNAL] ${args.path} from ${args.importer}`);
 
                 return { path: args.path, external: true };
               });
