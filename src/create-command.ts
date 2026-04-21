@@ -4,6 +4,7 @@ import * as _ from 'lodash';
 import { Forge, ForgeOptions } from './ng';
 import * as fs from 'fs-extra';
 import * as path from 'node:path';
+import { Schema } from '@open-norantec/utilities';
 
 interface CommandOption {
   flags: string;
@@ -24,11 +25,11 @@ const CREATE_COMMAND_OPTIONS = z.object({
 export const createCommand = (
   rawOptions: z.infer<typeof CREATE_COMMAND_OPTIONS> & {
     defaultOptions?: Partial<ForgeOptions>;
-    onLog?: (level: string, message: string) => void;
+    onLog?: (level: Schema.LogLevel, message: string) => void;
   },
 ) => {
   const options = _.attempt(() => CREATE_COMMAND_OPTIONS.parse(rawOptions));
-  const log = (level: string, ...messages: string[]) => {
+  const log = (level: Schema.LogLevel, ...messages: string[]) => {
     _.attempt(() => rawOptions.onLog?.(level, messages?.join?.(' ')));
   };
 
@@ -66,7 +67,7 @@ export const createCommand = (
         defaultValue: false,
       },
       {
-        flags: '--definitions <string>',
+        flags: '--definitions-file <string>',
         description: 'Path for definitions JSON file',
       },
       {
@@ -98,18 +99,15 @@ export const createCommand = (
     .argument('<output>', 'The output file for the generated code');
 
   command.action(async (source: string, output: string, options: Record<string, any> = {}) => {
-    // TODO: definitions
     const {
       executeAfterBuild,
       tsProject,
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
       define,
-      // eslint-disable-next-line @typescript-eslint/no-unused-vars
-      definitions: definitionsFile,
+      definitionsFile,
       disableWriteFile = false,
       ...otherOptions
     } = options;
-    const definitions = {};
+
     const forge = new Forge({
       onLog: log,
       onOutputFile: (filePath, content) => {
@@ -139,7 +137,9 @@ export const createCommand = (
       },
       ...rawOptions?.defaultOptions,
       ...otherOptions,
-      definitions,
+      definitionsFile,
+      define,
+      cwd: process.cwd(),
       entry: source,
       outputFile: output,
       tsProject,

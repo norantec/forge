@@ -16,7 +16,9 @@ import * as crypto from 'node:crypto';
 
 const FORGE_OPTIONS_SCHEMA = z.object({
   bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]),
-  definitions: z.record(z.string()).optional().default({}),
+  cwd: z.string().nonempty(),
+  define: z.array(z.string().nonempty()).optional(),
+  definitionsFile: z.string().nonempty().optional(),
   entry: z.string().nonempty(),
   executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
   obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
@@ -97,7 +99,7 @@ export class Forge {
     if (!!this.options.watch) {
       Array.from(this.CONCERNED_FILES.keys()).forEach((filePath) => this.CONCERNED_FILES.delete(filePath));
       tsConfig.fileNames.forEach((fileName) => {
-        const filePath = path.resolve(fileName);
+        const filePath = this.pathResolve(fileName);
         this.CONCERNED_FILES.set(
           filePath,
           crypto.createHash('sha256').update(this.originalOptions.onGetFileContent(filePath)).digest('hex'),
@@ -109,7 +111,11 @@ export class Forge {
     const buildEntryFilePath = ((parsedCommandLine: ts.ParsedCommandLine) => {
       const result = _.attempt(() =>
         ts
-          .getOutputFileNames(parsedCommandLine, path.relative(process.cwd(), path.resolve(this.options.entry)), false)
+          .getOutputFileNames(
+            parsedCommandLine,
+            path.relative(this.options.cwd, this.pathResolve(this.options.entry)),
+            false,
+          )
           .find((filePath) => filePath.endsWith('.js')),
       );
       if (result instanceof Error) return undefined;
@@ -119,14 +125,14 @@ export class Forge {
       if (StringUtil.isFalsyString(entryFilePath)) return undefined;
       if (typeof this.originalOptions.getVirtualEntryFileContent !== 'function') return undefined;
       return this.originalOptions.getVirtualEntryFileContent!(entryFilePath!);
-    })(path.resolve(buildEntryFilePath!));
+    })(this.pathResolve(buildEntryFilePath!));
 
     const finalBuildEntryFilePath =
       typeof buildEntryFilePath === 'undefined'
         ? null
         : StringUtil.isFalsyString(virtualEntryFileContent)
           ? buildEntryFilePath
-          : path.resolve(
+          : this.pathResolve(
               path.dirname(buildEntryFilePath),
               `entry-${Date.now()}-${Math.random().toString(16).slice(2)}.js`,
             );
@@ -145,7 +151,7 @@ export class Forge {
     const loadObfuscatorConfig = (): ObfuscatorOptions => {
       if (StringUtil.isFalsyString(this.options.obfuscatorConfigFilePath)) return {};
 
-      const absoluteObfuscatorConfigFilePath = path.resolve(this.options.obfuscatorConfigFilePath!);
+      const absoluteObfuscatorConfigFilePath = this.pathResolve(this.options.obfuscatorConfigFilePath!);
       const obfuscatorConfig = _.attempt(() =>
         requireFromString(this.originalOptions.onGetFileContent(absoluteObfuscatorConfigFilePath)),
       );
@@ -157,7 +163,7 @@ export class Forge {
 
     const esbuildContext = await AttemptUtil.execPromise(
       esbuild.context({
-        entryPoints: [path.resolve(finalBuildEntryFilePath)],
+        entryPoints: [this.pathResolve(finalBuildEntryFilePath)],
         bundle: true,
         platform: 'node',
         loader: {
@@ -166,7 +172,35 @@ export class Forge {
         logLevel: 'silent',
         format: 'cjs',
         write: false,
-        define: this.options.definitions,
+        define: (() => {
+          const definitions: Record<string, string> = {};
+
+          if (!StringUtil.isFalsyString(this.options.definitionsFile)) {
+            _.attempt(() => {
+              const definitionsContent = JSON.parse(
+                this.originalOptions.onGetFileContent(path.resolve(this.options.definitionsFile!)),
+              );
+              if (!_.isPlainObject(definitionsContent)) return;
+              Object.entries(definitionsContent).forEach(([key, value]) => {
+                if (StringUtil.isFalsyString(key)) return;
+                definitions[key] = JSON.stringify(value);
+              });
+            });
+          }
+
+          if (Array.isArray(this.options.define)) {
+            this.options.define.forEach((defineItem) => {
+              const [key, value] = defineItem.split('=');
+              const parsedValue = _.attempt(() => JSON.parse(value));
+              if (StringUtil.isFalsyString(key) || parsedValue instanceof Error) return;
+              definitions[key] = JSON.stringify(parsedValue);
+            });
+          }
+
+          this.log('info', `Using definitions: ${JSON.stringify(definitions)}`);
+
+          return definitions;
+        })(),
         plugins: [
           {
             name: 'tsconfig-paths',
@@ -211,7 +245,7 @@ export class Forge {
                   return;
                 }
 
-                const absoluteOutputFile = path.resolve(this.options.outputFile);
+                const absoluteOutputFile = this.pathResolve(this.options.outputFile);
                 let resultCode = result.outputFiles?.[0]?.text;
 
                 if (StringUtil.isFalsyString(resultCode)) {
@@ -254,13 +288,13 @@ export class Forge {
 
                 if (outputMap.has(args.importer)) {
                   const targetPaths: string[] = [];
-                  const absoluteImportPath = path.resolve(path.dirname(args.importer), args.path);
+                  const absoluteImportPath = this.pathResolve(path.dirname(args.importer), args.path);
 
                   if (!['.js', '.cjs'].includes(path.extname(absoluteImportPath))) {
                     targetPaths.push(absoluteImportPath + '.js');
                     targetPaths.push(absoluteImportPath + '.cjs');
-                    targetPaths.push(path.resolve(absoluteImportPath, 'index.js'));
-                    targetPaths.push(path.resolve(absoluteImportPath, 'index.cjs'));
+                    targetPaths.push(this.pathResolve(absoluteImportPath, 'index.js'));
+                    targetPaths.push(this.pathResolve(absoluteImportPath, 'index.cjs'));
                   } else {
                     targetPaths.push(absoluteImportPath);
                   }
@@ -381,7 +415,7 @@ export class Forge {
     tsProgram.emit(
       undefined,
       (fileName, data) => {
-        const absolutePath = path.resolve(fileName);
+        const absolutePath = this.pathResolve(fileName);
         outputMap.set(absolutePath, data);
         this.log('info', `Compiled ${absolutePath}`);
       },
@@ -421,5 +455,9 @@ export class Forge {
       this.log('info', `Current bundle execution exited (${code}), waiting for next execution...`);
       this.WORKERS.delete(worker);
     });
+  }
+
+  protected pathResolve(...pathSegments: string[]) {
+    return path.resolve(this.options.cwd, ...pathSegments);
   }
 }
