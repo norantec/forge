@@ -19,19 +19,37 @@ function collect(value: string, previous: string[]) {
 
 const CREATE_COMMAND_OPTIONS = z.object({
   hiddenOptions: z.array(z.string().nonempty()).optional(),
-  name: z.string().optional(),
 });
 
-export const createCommand = (
-  rawOptions: z.infer<typeof CREATE_COMMAND_OPTIONS> & {
-    defaultOptions?: (
-      source: string,
-      output: string | undefined,
-      options: Record<string, any>,
-    ) => Partial<ForgeOptions>;
-    onLog?: (level: Schema.LogLevel, message: string) => void;
-  },
-) => {
+export type CreateCommandOptions = z.infer<typeof CREATE_COMMAND_OPTIONS> & {
+  defaultOptions?: (source: string, output: string | undefined, options: Record<string, any>) => Partial<ForgeOptions>;
+  onLog?: (level: Schema.LogLevel, message: string) => void;
+};
+
+export interface CreateCommandFactoryContext {
+  addArgument: typeof Command.prototype.argument;
+  addOption: typeof Command.prototype.option;
+  addRequiredOption: typeof Command.prototype.requiredOption;
+}
+
+export type CreateCommandInput =
+  | CreateCommandOptions
+  | ((context: CreateCommandFactoryContext) => CreateCommandOptions);
+
+export const createCommand = (name: string, input: CreateCommandInput) => {
+  const command = new Command(name);
+  const rawOptions = _.attempt(() => {
+    return typeof input === 'function'
+      ? input({
+          addArgument: command.argument.bind(command),
+          addOption: command.option.bind(command),
+          addRequiredOption: command.requiredOption.bind(command),
+        })
+      : input;
+  });
+
+  if (rawOptions instanceof Error) return;
+
   const options = _.attempt(() => CREATE_COMMAND_OPTIONS.parse(rawOptions));
   const log = (level: Schema.LogLevel, ...messages: string[]) => {
     _.attempt(() => rawOptions.onLog?.(level, messages?.join?.(' ')));
@@ -41,8 +59,6 @@ export const createCommand = (
     log('error', 'Invalid options provided to createCommand:', options.message);
     return;
   }
-
-  const command = new Command(options.name);
 
   (
     [
