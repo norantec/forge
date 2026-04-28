@@ -37,12 +37,12 @@ export type Watcher = {
 
 export interface ForgeUnserializableOptions {
   customTransformers?: (program: ts.Program) => ts.CustomTransformers;
-  getVirtualEntryFileContent?: (buildEntryFilePath: string) => string;
+  getVirtualEntryFileContent?: (buildEntryFilePath: string) => string | Promise<string>;
   getWatcher?: (callback: (filePath: string) => void | Promise<void>) => Watcher;
   onGetFileContent: (filePath: string) => string;
   onOutputFile: (filePath: string, content: string) => void;
   onLog?: (level: Schema.LogLevel, message?: string) => void;
-  rewriteOutputFile?: (code: string) => string;
+  rewriteOutputFile?: (code: string) => string | Promise<string>;
 }
 
 export type ForgeOptions = ForgeSerializableOptions & ForgeUnserializableOptions;
@@ -120,7 +120,7 @@ export class Forge {
       if (result instanceof Error) return undefined;
       return result;
     })(tsConfig);
-    const virtualEntryFileContent = ((entryFilePath) => {
+    const virtualEntryFileContent = await (async (entryFilePath) => {
       if (StringUtil.isFalsyString(entryFilePath)) return undefined;
       if (typeof this.originalOptions.getVirtualEntryFileContent !== 'function') return undefined;
       return this.originalOptions.getVirtualEntryFileContent!(entryFilePath!);
@@ -238,7 +238,7 @@ export class Forge {
           {
             name: 'forge',
             setup: (build) => {
-              build.onEnd((result) => {
+              build.onEnd(async (result) => {
                 if (result.errors.length > 0) {
                   this.log('error', `Build failed with ${result.errors.length} errors`);
                   result.errors.forEach((error) => this.log('error', error.text));
@@ -264,7 +264,7 @@ export class Forge {
                 }
 
                 if (typeof this.originalOptions.rewriteOutputFile === 'function') {
-                  resultCode = this.originalOptions.rewriteOutputFile!(resultCode!);
+                  resultCode = await Promise.resolve(this.originalOptions.rewriteOutputFile!(resultCode!));
                 }
 
                 this.handleOutputFile(absoluteOutputFile, resultCode!, !!this.options.watch);
