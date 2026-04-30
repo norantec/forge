@@ -152,16 +152,26 @@ export class Forge {
     this.log('info', `Using entry file: ${finalBuildEntryFilePath}`);
 
     const loadObfuscatorConfig = (): ObfuscatorOptions => {
-      if (StringUtil.isFalsyString(this.options.obfuscatorConfigFilePath)) return {};
+      const defaultConfig: ObfuscatorOptions = {
+        ignoreImports: true,
+        deadCodeInjection: true,
+        controlFlowFlattening: true,
+        debugProtection: true,
+        numbersToExpressions: true,
+        splitStrings: true,
+        target: 'node',
+      };
+
+      if (StringUtil.isFalsyString(this.options.obfuscatorConfigFilePath)) return defaultConfig;
 
       const absoluteObfuscatorConfigFilePath = this.pathResolve(this.options.obfuscatorConfigFilePath!);
       const obfuscatorConfig = _.attempt(() =>
         requireFromString(this.originalOptions.onGetFileContent(absoluteObfuscatorConfigFilePath)),
       );
 
-      if (obfuscatorConfig instanceof Error) return {};
+      if (obfuscatorConfig instanceof Error) return defaultConfig;
 
-      return obfuscatorConfig;
+      return _.merge({}, defaultConfig, obfuscatorConfig);
     };
 
     const esbuildContext = await AttemptUtil.execPromise(
