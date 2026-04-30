@@ -96,6 +96,22 @@ export const createCommand = (name: string, input: CreateCommandInput) => {
         defaultValue: false,
       },
       {
+        flags: '--disable-minify',
+        defaultValue: false,
+      },
+      {
+        flags: '--disable-minify-identifiers',
+        defaultValue: false,
+      },
+      {
+        flags: '--disable-minify-syntax',
+        defaultValue: false,
+      },
+      {
+        flags: '--disable-minify-whitespace',
+        defaultValue: false,
+      },
+      {
         flags: '--execute-after-build',
         description: 'Execute the generated code after rebuild, only works for watch mode',
       },

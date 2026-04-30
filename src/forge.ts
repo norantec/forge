@@ -19,6 +19,10 @@ const FORGE_OPTIONS_SCHEMA = z.object({
   cwd: z.string().nonempty(),
   define: z.array(z.string().nonempty()).optional(),
   definitionsFile: z.string().nonempty().optional(),
+  disableMinify: z.union([z.boolean().optional().default(false), z.undefined()]),
+  disableMinifyIdentifiers: z.union([z.boolean().optional().default(false), z.undefined()]),
+  disableMinifySyntax: z.union([z.boolean().optional().default(false), z.undefined()]),
+  disableMinifyWhitespace: z.union([z.boolean().optional().default(false), z.undefined()]),
   entry: z.string().nonempty(),
   executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
   externals: z.array(z.string().nonempty()).optional(),
@@ -172,6 +176,10 @@ export class Forge {
         external: this.options.externals,
         format: 'cjs',
         write: false,
+        minify: !this.options.disableMinify,
+        minifyIdentifiers: !this.options.disableMinifyIdentifiers,
+        minifySyntax: !this.options.disableMinifySyntax,
+        minifyWhitespace: !this.options.disableMinifyWhitespace,
         define: (() => {
           const definitions: Record<string, string> = {};
 
@@ -251,16 +259,6 @@ export class Forge {
                 if (StringUtil.isFalsyString(resultCode)) {
                   this.log('error', 'No output code generated');
                   return;
-                }
-
-                if (this.options.obfuscate) {
-                  resultCode = (() => {
-                    const obfuscatedCode = _.attempt(() => {
-                      return obfuscate(resultCode!, loadObfuscatorConfig()).getObfuscatedCode();
-                    });
-                    if (obfuscatedCode instanceof Error) return resultCode;
-                    return obfuscatedCode;
-                  })();
                 }
 
                 if (typeof this.originalOptions.rewriteOutputFile === 'function') {
@@ -344,9 +342,17 @@ export class Forge {
               });
 
               build.onLoad({ filter: /.*/, namespace: 'vfs' }, (args) => {
-                const contents = outputMap.get(args.path);
+                const rawContent = outputMap.get(args.path);
                 return {
-                  contents,
+                  contents: StringUtil.isFalsyString(rawContent)
+                    ? undefined
+                    : (() => {
+                        const obfuscatedCode = _.attempt(() => {
+                          return obfuscate(rawContent!, loadObfuscatorConfig()).getObfuscatedCode();
+                        });
+                        if (obfuscatedCode instanceof Error) return rawContent;
+                        return obfuscatedCode;
+                      })(),
                   loader: 'js',
                 };
               });
