@@ -356,13 +356,15 @@ export class Forge {
                 return {
                   contents: StringUtil.isFalsyString(rawContent)
                     ? undefined
-                    : (() => {
-                        const obfuscatedCode = _.attempt(() => {
-                          return obfuscate(rawContent!, loadObfuscatorConfig()).getObfuscatedCode();
-                        });
-                        if (obfuscatedCode instanceof Error) return rawContent;
-                        return obfuscatedCode;
-                      })(),
+                    : !this.options.obfuscate
+                      ? rawContent
+                      : (() => {
+                          const obfuscatedCode = _.attempt(() => {
+                            return obfuscate(rawContent!, loadObfuscatorConfig()).getObfuscatedCode();
+                          });
+                          if (obfuscatedCode instanceof Error) return rawContent;
+                          return obfuscatedCode;
+                        })(),
                   loader: 'js',
                 };
               });
