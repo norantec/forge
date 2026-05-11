@@ -14,22 +14,22 @@ import * as crypto from 'node:crypto';
 import { EnumTypes, z } from '@open-norantec/utilities';
 
 const FORGE_OPTIONS_SCHEMA = z.object({
-  bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  bundleDependencies: z.boolean().default(false).optional(),
   cwd: z.string().nonempty(),
   define: z.array(z.string().nonempty()).optional(),
   definitionsFile: z.string().nonempty().optional(),
-  disableMinify: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
-  disableMinifyIdentifiers: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
-  disableMinifySyntax: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
-  disableMinifyWhitespace: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  disableMinify: z.boolean().default(false).optional(),
+  disableMinifyIdentifiers: z.boolean().default(false).optional(),
+  disableMinifySyntax: z.boolean().default(false).optional(),
+  disableMinifyWhitespace: z.boolean().default(false).optional(),
   entry: z.string().nonempty(),
-  executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]).optional(),
+  executeAfterBuild: z.boolean().default(true).optional(),
   externals: z.array(z.string().nonempty()).optional(),
-  obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  obfuscate: z.boolean().default(false).optional(),
   obfuscatorConfigFilePath: z.string().optional(),
   outputFile: z.string().nonempty(),
-  tsProject: z.union([z.string().nonempty().default('tsconfig.json'), z.undefined()]).optional(),
-  watch: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  tsProject: z.string().nonempty().default('tsconfig.json').optional(),
+  watch: z.boolean().default(false).optional(),
 });
 
 export type ForgeSerializableOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
