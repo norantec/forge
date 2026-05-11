@@ -1,10 +1,9 @@
 import { Command } from 'commander';
-import { z } from 'zod';
 import * as _ from 'lodash';
 import { Forge, ForgeOptions } from './forge';
 import * as fs from 'fs-extra';
 import * as path from 'node:path';
-import { Schema, StringUtil } from '@open-norantec/utilities';
+import { EnumTypes, StringUtil, z } from '@open-norantec/utilities';
 
 interface CommandOption {
   flags: string;
@@ -23,7 +22,7 @@ const CREATE_COMMAND_OPTIONS = z.object({
 
 export type CreateCommandOptions = z.infer<typeof CREATE_COMMAND_OPTIONS> & {
   defaultOptions?: (source: string, output: string | undefined, options: Record<string, any>) => Partial<ForgeOptions>;
-  onLog?: (level: Schema.LogLevel, message: string) => void;
+  onLog?: (level: EnumTypes.LogLevel, message: string) => void;
 };
 
 export interface CreateCommandFactoryContext {
@@ -51,7 +50,7 @@ export const createCommand = (name: string, input: CreateCommandInput) => {
   if (rawOptions instanceof Error) return;
 
   const options = _.attempt(() => CREATE_COMMAND_OPTIONS.parse(rawOptions));
-  const log = (level: Schema.LogLevel, ...messages: string[]) => {
+  const log = (level: EnumTypes.LogLevel, ...messages: string[]) => {
     _.attempt(() => rawOptions.onLog?.(level, messages?.join?.(' ')));
   };
 
@@ -195,6 +194,7 @@ export const createCommand = (name: string, input: CreateCommandInput) => {
       tsProject,
       executeAfterBuild,
     });
+
     await forge.run();
   });
 

@@ -1,6 +1,4 @@
-import { z } from 'zod';
 import { init, parse as parseESModuleLex } from 'es-module-lexer';
-import { Schema } from '@open-norantec/utilities/dist/schema-util.class';
 import * as _ from 'lodash';
 import * as ts from 'typescript';
 import * as esbuild from 'esbuild';
@@ -13,24 +11,25 @@ import * as requireFromString from 'require-from-string';
 import { StringUtil } from '@open-norantec/utilities/dist/string-util.class';
 import { Worker } from 'node:worker_threads';
 import * as crypto from 'node:crypto';
+import { EnumTypes, z } from '@open-norantec/utilities';
 
 const FORGE_OPTIONS_SCHEMA = z.object({
-  bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]),
+  bundleDependencies: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
   cwd: z.string().nonempty(),
   define: z.array(z.string().nonempty()).optional(),
   definitionsFile: z.string().nonempty().optional(),
-  disableMinify: z.union([z.boolean().optional().default(false), z.undefined()]),
-  disableMinifyIdentifiers: z.union([z.boolean().optional().default(false), z.undefined()]),
-  disableMinifySyntax: z.union([z.boolean().optional().default(false), z.undefined()]),
-  disableMinifyWhitespace: z.union([z.boolean().optional().default(false), z.undefined()]),
+  disableMinify: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  disableMinifyIdentifiers: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  disableMinifySyntax: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
+  disableMinifyWhitespace: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
   entry: z.string().nonempty(),
-  executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]),
+  executeAfterBuild: z.union([z.boolean().optional().default(true), z.undefined()]).optional(),
   externals: z.array(z.string().nonempty()).optional(),
-  obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]),
+  obfuscate: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
   obfuscatorConfigFilePath: z.string().optional(),
   outputFile: z.string().nonempty(),
-  tsProject: z.union([z.string().nonempty().default('tsconfig.json'), z.undefined()]),
-  watch: z.union([z.boolean().optional().default(false), z.undefined()]),
+  tsProject: z.union([z.string().nonempty().default('tsconfig.json'), z.undefined()]).optional(),
+  watch: z.union([z.boolean().optional().default(false), z.undefined()]).optional(),
 });
 
 export type ForgeSerializableOptions = z.infer<typeof FORGE_OPTIONS_SCHEMA>;
@@ -45,7 +44,7 @@ export interface ForgeUnserializableOptions {
   getWatcher?: (callback: (filePath: string) => void | Promise<void>) => Watcher;
   onGetFileContent: (filePath: string) => string;
   onOutputFile: (filePath: string, content: string) => void;
-  onLog?: (level: Schema.LogLevel, message?: string) => void;
+  onLog?: (level: EnumTypes.LogLevel, message?: string) => void;
   rewriteOutputFile?: (code: string) => string | Promise<string>;
 }
 
@@ -445,7 +444,7 @@ export class Forge {
     await esbuildContext.dispose();
   }
 
-  protected log(level: Schema.LogLevel, ...messages: string[]) {
+  protected log(level: EnumTypes.LogLevel, ...messages: string[]) {
     _.attempt(() => this.originalOptions?.onLog?.(level, messages?.join?.(' ')));
   }
 
