@@ -4,7 +4,7 @@ import * as ts from 'typescript';
 import * as esbuild from 'esbuild';
 import * as path from 'path';
 import { AttemptUtil } from '@open-norantec/utilities/dist/attempt-util.class';
-import * as module from 'node:module';
+import * as nodeModule from 'node:module';
 import * as babel from '@babel/core';
 import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
 import * as requireFromString from 'require-from-string';
@@ -284,7 +284,7 @@ export class Forge {
 
                 if (
                   args.path.startsWith('node:') ||
-                  module.builtinModules.some((moduleName) => moduleName === args.path.split('/')[0])
+                  nodeModule.builtinModules.some((moduleName) => moduleName === args.path.split('/')[0])
                 ) {
                   return { path: args.path, external: true };
                 }
