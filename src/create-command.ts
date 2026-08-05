@@ -9,7 +9,10 @@ interface CommandOption {
   flags: string;
   defaultValue?: string | boolean | string[];
   description: string;
-  parser?: (value: string, previous: string[]) => any;
+  parser?: (
+    value: string,
+    previous: string | boolean | string[] | undefined,
+  ) => string | boolean | string[] | undefined;
 }
 
 function collect(value: string, previous: string[]) {
@@ -128,7 +131,7 @@ export const createCommand = (name: string, input: CreateCommandInput) => {
     ] as CommandOption[]
   ).forEach((commandOption) => {
     if (options.hiddenOptions?.includes?.(commandOption.flags)) return;
-    command.option(
+    command.option<CommandOption['defaultValue']>(
       commandOption.flags,
       commandOption.description,
       typeof commandOption.parser === 'function' ? commandOption.parser : (values) => values,
@@ -153,7 +156,9 @@ export const createCommand = (name: string, input: CreateCommandInput) => {
     } = options;
 
     const forge = new Forge({
-      onLog: log,
+      onLog: (level, message) => {
+        log(level, message!);
+      },
       onOutputFile: (filePath, content) => {
         if (!disableWriteFile) {
           const dir = path.dirname(filePath);
