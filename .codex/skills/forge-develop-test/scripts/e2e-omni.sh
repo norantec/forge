@@ -26,7 +26,7 @@ echo "deployed new dist (previous backed up at $backup_dir)"
 (cd "$OMNI_API_DIR" && npm run build)
 echo "omni-api build OK"
 
-log_file="$(mktemp /tmp/omni-main-XXXXXX.log)"
+log_file="$(mktemp /tmp/omni-main-XXXXXX)"
 cd "$OMNI_API_DIR"
 node ./dist/main.js >"$log_file" 2>&1 &
 server_pid=$!

@@ -310,45 +310,59 @@ export class Forge {
                   const requiredPath = _.attempt(() => {
                     // Match the importing code's module semantics: ESM imports
                     // resolve `import` conditions (needed for ESM-only packages),
-                    // while CJS `require` calls keep CommonJS resolution.
-                    const conditions = new Set(
-                      args.kind === 'require-call' ? ['node', 'require', 'default'] : ['node', 'import', 'default'],
-                    );
+                    // while CJS `require` calls keep CommonJS resolution and only
+                    // fall back to `import` conditions when the package has no
+                    // CommonJS entry (e.g. ESM-only packages).
+                    const conditionSets =
+                      args.kind === 'require-call'
+                        ? [
+                            ['node', 'require', 'default'],
+                            ['node', 'import', 'default'],
+                          ]
+                        : [['node', 'import', 'default']];
 
-                    if (args.path.startsWith('#')) {
-                      // `#`-prefixed specifiers are package imports: they must be
-                      // resolved against the `imports` field of the package scope
-                      // that contains the importing file, not forge's own scope.
-                      const resolve = createRequire(args.importer || this.pathResolve(this.options.entry)).resolve as (
-                        id: string,
-                        options?: { conditions?: Set<string> },
-                      ) => string;
-                      return resolve(args.path, { conditions });
+                    const ancestorPaths = [
+                      ...(() => {
+                        const result: string[] = [];
+                        let currentDir = path.dirname(args.importer);
+
+                        result.push(currentDir);
+
+                        while (currentDir !== path.dirname(currentDir)) {
+                          result.push(path.dirname(currentDir));
+                          currentDir = path.dirname(currentDir);
+                        }
+
+                        return result;
+                      })(),
+                      ...(require.resolve.paths('') || []),
+                    ];
+
+                    let lastError: Error | undefined;
+                    for (const conditionList of conditionSets) {
+                      const conditions = new Set(conditionList);
+                      const resolved = _.attempt(() => {
+                        if (args.path.startsWith('#')) {
+                          // `#`-prefixed specifiers are package imports: they must be
+                          // resolved against the `imports` field of the package scope
+                          // that contains the importing file, not forge's own scope.
+                          const resolve = createRequire(args.importer || this.pathResolve(this.options.entry))
+                            .resolve as (id: string, options?: { conditions?: Set<string> }) => string;
+                          return resolve(args.path, { conditions });
+                        }
+
+                        const resolve = require.resolve as (
+                          id: string,
+                          options?: { paths?: string[]; conditions?: Set<string> },
+                        ) => string;
+                        return resolve(args.path, { conditions, paths: ancestorPaths });
+                      });
+
+                      if (!(resolved instanceof Error)) return resolved;
+                      lastError = resolved;
                     }
 
-                    const resolve = require.resolve as (
-                      id: string,
-                      options?: { paths?: string[]; conditions?: Set<string> },
-                    ) => string;
-                    return resolve(args.path, {
-                      conditions,
-                      paths: [
-                        ...(() => {
-                          const result: string[] = [];
-                          let currentDir = path.dirname(args.importer);
-
-                          result.push(currentDir);
-
-                          while (currentDir !== path.dirname(currentDir)) {
-                            result.push(path.dirname(currentDir));
-                            currentDir = path.dirname(currentDir);
-                          }
-
-                          return result;
-                        })(),
-                        ...(require.resolve.paths('') || []),
-                      ],
-                    });
+                    return lastError ?? new Error(`Failed to resolve ${args.path}`);
                   });
 
                   if (!(requiredPath instanceof Error)) {
