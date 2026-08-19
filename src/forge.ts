@@ -1,11 +1,11 @@
-import { init, parse as parseESModuleLex } from 'es-module-lexer';
+import { init } from 'es-module-lexer';
 import * as _ from 'lodash';
 import * as ts from 'typescript';
 import * as esbuild from 'esbuild';
 import * as path from 'path';
 import { AttemptUtil } from '@open-norantec/utilities/dist/attempt-util.class';
+import { createRequire } from 'node:module';
 import * as nodeModule from 'node:module';
-import * as babel from '@babel/core';
 import { ObfuscatorOptions, obfuscate } from 'javascript-obfuscator';
 import * as requireFromString from 'require-from-string';
 import { StringUtil } from '@open-norantec/utilities/dist/string-util.class';
@@ -49,11 +49,6 @@ export interface ForgeUnserializableOptions {
 }
 
 export type ForgeOptions = ForgeSerializableOptions & ForgeUnserializableOptions;
-
-function maybeESModule(code: string) {
-  const [imports, exports] = parseESModuleLex(code);
-  return imports.length > 0 || exports.length > 0;
-}
 
 export class Forge {
   protected readonly WORKERS = new Set<Worker>();
@@ -312,8 +307,31 @@ export class Forge {
                 }
 
                 if (this.options.bundleDependencies) {
-                  const requiredPath = _.attempt(() =>
-                    require.resolve(args.path, {
+                  const requiredPath = _.attempt(() => {
+                    // Match the importing code's module semantics: ESM imports
+                    // resolve `import` conditions (needed for ESM-only packages),
+                    // while CJS `require` calls keep CommonJS resolution.
+                    const conditions = new Set(
+                      args.kind === 'require-call' ? ['node', 'require', 'default'] : ['node', 'import', 'default'],
+                    );
+
+                    if (args.path.startsWith('#')) {
+                      // `#`-prefixed specifiers are package imports: they must be
+                      // resolved against the `imports` field of the package scope
+                      // that contains the importing file, not forge's own scope.
+                      const resolve = createRequire(args.importer || this.pathResolve(this.options.entry)).resolve as (
+                        id: string,
+                        options?: { conditions?: Set<string> },
+                      ) => string;
+                      return resolve(args.path, { conditions });
+                    }
+
+                    const resolve = require.resolve as (
+                      id: string,
+                      options?: { paths?: string[]; conditions?: Set<string> },
+                    ) => string;
+                    return resolve(args.path, {
+                      conditions,
                       paths: [
                         ...(() => {
                           const result: string[] = [];
@@ -330,8 +348,8 @@ export class Forge {
                         })(),
                         ...(require.resolve.paths('') || []),
                       ],
-                    }),
-                  );
+                    });
+                  });
 
                   if (!(requiredPath instanceof Error)) {
                     return { path: requiredPath, namespace: outputMap.has(requiredPath) ? 'vfs' : undefined };
@@ -374,27 +392,6 @@ export class Forge {
                 if (code instanceof Error) {
                   this.log('error', `Failed to read file content for ${args.path}: ${code.message}`);
                   return null;
-                }
-
-                if (maybeESModule(code)) {
-                  const transformed = _.attempt(() => {
-                    return babel.transformSync(code, {
-                      plugins: [require.resolve('@babel/plugin-transform-modules-commonjs')],
-                    });
-                  });
-
-                  if (transformed instanceof Error) {
-                    this.log('error', `Failed to transform ES module for ${args.path}: ${transformed.message}`);
-                    return {
-                      contents: code,
-                      loader: 'js',
-                    };
-                  }
-
-                  return {
-                    contents: transformed?.code || code,
-                    loader: 'js',
-                  };
                 }
 
                 return {
