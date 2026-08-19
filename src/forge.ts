@@ -44,7 +44,7 @@ export interface ForgeUnserializableOptions {
   getWatcher?: (callback: (filePath: string) => void | Promise<void>) => Watcher;
   onGetFileContent: (filePath: string) => string;
   onOutputFile: (filePath: string, content: string) => void;
-  onLog?: (level: EnumTypes.LogLevel, message?: string) => void;
+  onLog?: (level: EnumTypes['LogLevel'], message?: string) => void;
   rewriteOutputFile?: (code: string) => string | Promise<string>;
 }
 
@@ -441,7 +441,7 @@ export class Forge {
     await esbuildContext.dispose();
   }
 
-  protected log(level: EnumTypes.LogLevel, ...messages: string[]) {
+  protected log(level: EnumTypes['LogLevel'], ...messages: string[]) {
     _.attempt(() => this.originalOptions?.onLog?.(level, messages?.join?.(' ')));
   }
 

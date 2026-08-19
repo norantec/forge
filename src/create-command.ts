@@ -25,7 +25,7 @@ const CREATE_COMMAND_OPTIONS = z.object({
 
 export type CreateCommandOptions = z.infer<typeof CREATE_COMMAND_OPTIONS> & {
   defaultOptions?: (source: string, output: string | undefined, options: Record<string, any>) => Partial<ForgeOptions>;
-  onLog?: (level: EnumTypes.LogLevel, message: string) => void;
+  onLog?: (level: EnumTypes['LogLevel'], message: string) => void;
 };
 
 export interface CreateCommandFactoryContext {
@@ -53,7 +53,7 @@ export const createCommand = (name: string, input: CreateCommandInput) => {
   if (rawOptions instanceof Error) return;
 
   const options = _.attempt(() => CREATE_COMMAND_OPTIONS.parse(rawOptions));
-  const log = (level: EnumTypes.LogLevel, ...messages: string[]) => {
+  const log = (level: EnumTypes['LogLevel'], ...messages: string[]) => {
     _.attempt(() => rawOptions.onLog?.(level, messages?.join?.(' ')));
   };
 
